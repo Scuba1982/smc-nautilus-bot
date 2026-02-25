@@ -1,0 +1,58 @@
+﻿# =====================================================
+# SEISMIC SMC TERMINAL - configuration
+# API keys should be stored in environment variables:
+#   set BINANCE_API_KEY=your_key
+#   set BINANCE_API_SECRET=your_secret
+# Run: python flask_server.py
+# Open: http://localhost:5000
+# =====================================================
+
+# Trading instrument SPOT: SYMBOL.BINANCE
+instrument_id: BTCUSDT.BINANCE
+
+# --- ADAPTIVE BUCKET ---
+# bucket_usd is calculated INSTANTLY before connecting to Binance:
+#   GET https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT
+#   bucket_usd = quoteVolume_24h / 1500
+# This gives ~1500 packets per day for any coin:
+#   BTC  (~30B/day)  -> bucket ~$20M
+#   SOL  (~3B/day)   -> bucket ~$2M
+#   DOGE (~500M/day) -> bucket ~$330k
+# Fallback (if API unavailable):
+bucket_usd: 0
+
+# --- SMC parameters ---
+swing_length: 50
+lag: 50
+
+# --- Orders ---
+tp_pct: 0.009
+sl_pct: 0.003
+trade_size: 0.01
+max_positions: 1
+smc_threshold: 0.5
+
+# --- Model ---
+model_path: models/smc_model.json
+
+# --- Binance API ---
+api_key: "WhxJ36s27u5b2QtLgQq0S1zXsKt1nYz7ZvCdh54s3fcoakbuWQfj5BKMpdMRU5uR"
+api_secret: "j12MQjPSuHjHgi60NKSES12FmQyiNY8DWpj1eqpQBU29zZKhY0Bh34jvIz175EE7"
+testnet: false
+
+# --- Connection (important with VPN) ---
+connection:
+  timeout_sec: 60
+  max_retries: 5
+  retry_delay_sec: 10
+
+# --- Flask server ---
+flask:
+  host: 0.0.0.0
+  port: 5000
+  debug: false
+
+# --- GMM server (optional) ---
+gmm:
+  enabled: false
+  server_url: ws://localhost:8765

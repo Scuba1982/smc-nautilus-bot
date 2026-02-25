@@ -1,0 +1,1139 @@
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SMC SCREENER</title>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        *,
+        *::before,
+        *::after {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            height: 100%;
+            width: 100%;
+            margin: 0;
+            padding: 0;
+            background: #0a0a0a;
+            color: #ccc;
+            font-family: Consolas, 'Courier New', monospace;
+            font-size: 13px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* ─── HEADER ──────────────────────────────────────── */
+        .header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 16px;
+            background: #070707;
+            border-bottom: 1px solid #1c1c1c;
+            flex-shrink: 0;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin-left: auto;
+        }
+
+        .btn-scan {
+            background: #10b981;
+            color: #000;
+            border: none;
+            padding: 8px 20px;
+            font-weight: 800;
+            font-size: 13px;
+            font-family: inherit;
+            cursor: pointer;
+            border-radius: 3px;
+            letter-spacing: 1px;
+            transition: background 0.2s;
+        }
+
+        .btn-scan:hover {
+            background: #34d399;
+        }
+
+        .btn-scan:disabled {
+            background: #333;
+            color: #666;
+            cursor: not-allowed;
+        }
+
+        #connStatus {
+            font-size: 11px;
+            padding: 3px 10px;
+            border-radius: 3px;
+            background: #111;
+            border: 1px solid #333;
+        }
+
+        #connStatus.ok {
+            color: #39ff14;
+            border-color: #39ff14;
+        }
+
+        #connStatus.err {
+            color: #ff073a;
+            border-color: #ff073a;
+        }
+
+        .stat {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-width: 60px;
+            padding: 0 8px;
+            border-right: 1px solid #1c1c1c;
+        }
+
+        .stat:last-child {
+            border-right: none;
+        }
+
+        .stat-label {
+            font-size: 9px;
+            color: #555;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .stat-value {
+            font-size: 14px;
+            font-weight: bold;
+            color: #eee;
+        }
+
+        .mode-switch {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            padding: 4px 10px;
+            border: 1px solid #282828;
+            border-radius: 3px;
+            background: #111;
+        }
+
+        .mode-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+
+        .mode-dot.paper {
+            background: #39ff14;
+            box-shadow: 0 0 6px rgba(57, 255, 20, 0.4);
+        }
+
+        .mode-dot.real {
+            background: #ff073a;
+            box-shadow: 0 0 6px rgba(255, 7, 58, 0.4);
+        }
+
+        .mode-switch select {
+            background: #111;
+            border: 1px solid #333;
+            color: #ccc;
+            font-family: inherit;
+            font-size: 11px;
+            padding: 2px 4px;
+            outline: none;
+        }
+
+        /* ─── PROGRESS BAR ────────────────────────────────── */
+        .progress-bar {
+            height: 4px;
+            background: #111;
+            flex-shrink: 0;
+            position: relative;
+        }
+
+        .progress-bar-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #f59e0b, #10b981);
+            transition: width 0.3s linear;
+        }
+
+        /* ─── MAIN CONTENT ────────────────────────────────── */
+        .main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            padding: 0;
+        }
+
+        /* ─── SCANNER STATUS ──────────────────────────────── */
+        .scanner-status {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 6px 16px;
+            background: #080808;
+            border-bottom: 1px solid #151515;
+            flex-shrink: 0;
+        }
+
+        .scanner-status .status-text {
+            font-size: 11px;
+            color: #555;
+            letter-spacing: 1px;
+        }
+
+        .scanner-status .status-text.active {
+            color: #39ff14;
+        }
+
+        .scanner-status .status-text.loading {
+            color: #f59e0b;
+        }
+
+        /* ─── COIN TABLE ──────────────────────────────────── */
+        .table-container {
+            flex: 1;
+            overflow-y: auto;
+            min-height: 0;
+        }
+
+        .table-container::-webkit-scrollbar {
+            width: 5px;
+        }
+
+        .table-container::-webkit-scrollbar-track {
+            background: #0a0a0a;
+        }
+
+        .table-container::-webkit-scrollbar-thumb {
+            background: #282828;
+            border-radius: 3px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        thead {
+            position: sticky;
+            top: 0;
+            z-index: 2;
+        }
+
+        th {
+            background: #0d0d0d;
+            color: #555;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            padding: 8px 10px;
+            text-align: left;
+            font-weight: bold;
+            border-bottom: 1px solid #1c1c1c;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        th:hover {
+            color: #999;
+        }
+
+        th.sorted-asc::after {
+            content: " \u25B2";
+            color: #39ff14;
+        }
+
+        th.sorted-desc::after {
+            content: " \u25BC";
+            color: #ff073a;
+        }
+
+        td {
+            padding: 6px 10px;
+            border-bottom: 1px solid #0f0f0f;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+
+        tr {
+            transition: background 0.15s;
+        }
+
+        tr:hover {
+            background: #111;
+        }
+
+        tr.active {
+            background: #0f1a14;
+        }
+
+        tr.in-zone {
+            background: rgba(245, 158, 11, 0.06);
+        }
+
+        tr.entered {
+            background: rgba(16, 185, 129, 0.06);
+        }
+
+        .td-right {
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* ─── STATUS BADGES ───────────────────────────────── */
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 2px;
+            font-size: 10px;
+            font-weight: bold;
+            letter-spacing: 0.5px;
+        }
+
+        .badge-wait {
+            color: #555;
+            background: #151515;
+        }
+
+        .badge-near {
+            color: #f59e0b;
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid rgba(245, 158, 11, 0.2);
+        }
+
+        .badge-zone {
+            color: #f97316;
+            background: rgba(249, 115, 22, 0.12);
+            border: 1px solid rgba(249, 115, 22, 0.3);
+        }
+
+        .badge-enter {
+            color: #39ff14;
+            background: rgba(57, 255, 20, 0.08);
+            border: 1px solid rgba(57, 255, 20, 0.2);
+        }
+
+        .badge-tp {
+            color: #39ff14;
+            background: rgba(57, 255, 20, 0.15);
+            border: 1px solid rgba(57, 255, 20, 0.3);
+        }
+
+        .badge-sl {
+            color: #ff073a;
+            background: rgba(255, 7, 58, 0.12);
+            border: 1px solid rgba(255, 7, 58, 0.3);
+        }
+
+        .badge-skip {
+            color: #444;
+            background: #0d0d0d;
+        }
+
+        .badge-warmup {
+            color: #3b82f6;
+            background: rgba(59, 130, 246, 0.08);
+            border: 1px solid rgba(59, 130, 246, 0.2);
+        }
+
+        .c-g {
+            color: #39ff14;
+        }
+
+        .c-r {
+            color: #ff073a;
+        }
+
+        .c-y {
+            color: #f59e0b;
+        }
+
+        .c-b {
+            color: #3b82f6;
+        }
+
+        /* ─── POSITIONS SECTION ───────────────────────────── */
+        .positions-section {
+            flex-shrink: 0;
+            border-top: 1px solid #1c1c1c;
+            background: #080808;
+            max-height: 180px;
+            overflow-y: auto;
+        }
+
+        .section-title {
+            font-size: 10px;
+            color: #555;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            padding: 6px 16px;
+            background: #070707;
+            border-bottom: 1px solid #151515;
+        }
+
+        .pos-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 6px 16px;
+            border-bottom: 1px solid #0f0f0f;
+            font-size: 12px;
+        }
+
+        .pos-sym {
+            font-weight: bold;
+            color: #fff;
+            min-width: 80px;
+        }
+
+        .pos-side {
+            font-weight: bold;
+            min-width: 50px;
+        }
+
+        .pos-side.long {
+            color: #39ff14;
+        }
+
+        .pos-side.short {
+            color: #ff073a;
+        }
+
+        .pos-detail {
+            color: #666;
+            min-width: 100px;
+        }
+
+        .pos-detail span {
+            color: #aaa;
+        }
+
+        .pos-pnl {
+            font-weight: bold;
+            min-width: 80px;
+            text-align: right;
+        }
+
+        /* ─── LOG SECTION ─────────────────────────────────── */
+        .log-section {
+            flex-shrink: 0;
+            height: 160px;
+            background: #050505;
+            border-top: 1px solid #1c1c1c;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .log-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 4px 16px;
+            background: #070707;
+            border-bottom: 1px solid #111;
+            flex-shrink: 0;
+        }
+
+        .log-header span {
+            font-size: 10px;
+            color: #555;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+        }
+
+        .log-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #39ff14;
+            display: inline-block;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.3;
+            }
+        }
+
+        .log-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 4px 16px;
+            font-size: 11px;
+        }
+
+        .log-body::-webkit-scrollbar {
+            width: 3px;
+        }
+
+        .log-body::-webkit-scrollbar-thumb {
+            background: #282828;
+        }
+
+        .log-entry {
+            padding: 2px 0;
+            border-bottom: 1px solid #080808;
+        }
+
+        .log-time {
+            color: #333;
+            margin-right: 8px;
+        }
+    </style>
+</head>
+
+<body>
+    <!-- ─── HEADER ────────────────────────────────────────── -->
+    <div class="header">
+        <div class="header-left">
+            <button class="btn-scan" id="btnScan" onclick="startScan()">СТАРТ СКАН</button>
+            <span id="connStatus">&#9679; OFFLINE</span>
+        </div>
+        <div class="header-right">
+            <div class="stat">
+                <span class="stat-label">Монет</span>
+                <span class="stat-value" id="vCoins">0</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">Сетапов</span>
+                <span class="stat-value c-y" id="vSetups">0</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">Кошелёк</span>
+                <span class="stat-value" id="vWallet">10 000 $</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">PNL</span>
+                <span class="stat-value" id="vPnl">0.00</span>
+            </div>
+            <div class="mode-switch">
+                <span class="mode-dot paper" id="modeDot"></span>
+                <select id="tradeMode" onchange="setTradeMode(this.value)">
+                    <option value="paper">PAPER</option>
+                    <option value="real">REAL</option>
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <!-- ─── PROGRESS BAR ─────────────────────────────────── -->
+    <div class="progress-bar">
+        <div class="progress-bar-fill" id="progressFill"></div>
+    </div>
+
+    <!-- ─── MAIN ─────────────────────────────────────────── -->
+    <div class="main">
+        <!-- Scanner Status -->
+        <div class="scanner-status">
+            <span class="status-text" id="scannerStatus">IDLE — нажмите СТАРТ СКАН</span>
+        </div>
+
+        <!-- Coin Table -->
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th data-sort="symbol">Монета</th>
+                        <th data-sort="price" class="td-right">Цена</th>
+                        <th data-sort="vol24h" class="td-right">Объём 24h</th>
+                        <th data-sort="bucket" class="td-right">Бакет ($)</th>
+                        <th data-sort="volat" class="td-right">Волат%</th>
+                        <th data-sort="vpin" class="td-right">VPIN</th>
+                        <th data-sort="imbalance" class="td-right">Imb%</th>
+                        <th data-sort="er" class="td-right">ER</th>
+                        <th data-sort="oteDist" class="td-right">До OTE</th>
+                        <th data-sort="oteHigh" class="td-right">OTE Вход</th>
+                        <th data-sort="oteLow" class="td-right">OTE Дно</th>
+                        <th data-sort="model" class="td-right">Model%</th>
+                        <th data-sort="status">Статус</th>
+                    </tr>
+                </thead>
+                <tbody id="coinTableBody">
+                    <tr>
+                        <td colspan="13" style="text-align:center; color:#333; padding:40px;">
+                            Нажмите СТАРТ СКАН для начала работы
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Bottom Panel: Positions & Log (Side by Side) -->
+        <div class="bottom-panel"
+            style="display: flex; gap: 10px; height: 300px; padding: 10px; border-top: 1px solid #1c1c1c;">
+            <!-- Active Positions / Limits -->
+            <div class="positions-section" id="positionsSection"
+                style="flex: 1; display:none; flex-direction:column; background: #080808; border-right: 1px solid #1c1c1c; padding-right: 10px;">
+                <div class="section-title">Активные позиции & Лимитки</div>
+                <div id="positionsBody" style="flex:1; overflow-y:auto; padding:5px;"></div>
+            </div>
+
+            <!-- Log -->
+            <div class="log-section"
+                style="flex: 1; height: 100%; border-top: none; display:flex; flex-direction:column; background: #080808; padding-left: 10px;">
+                <div class="log-header">
+                    <span>Лог</span>
+                    <span style="display:flex; align-items:center; gap:5px;">
+                        <span class="log-dot"></span>
+                        <span style="color:#39ff14; font-size:9px;" id="logStatusText">Ready</span>
+                    </span>
+                </div>
+                <div class="log-body" id="logBody" style="flex:1; overflow-y:auto;">
+                    <div class="log-entry"><span class="log-time">--:--:--</span> Система готова. SMC Screener
+                        Dashboard.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ─── Подавление ошибок localStorage при file:// ───────────────────
+        window.addEventListener('unhandledrejection', function (e) {
+            var msg = (e.reason && e.reason.message) ? e.reason.message : String(e.reason || '');
+            if (msg.indexOf('storage') !== -1 || msg.indexOf('Storage') !== -1 || msg.indexOf('Access to') !== -1) {
+                e.preventDefault();
+            }
+        });
+        try {
+            Object.defineProperty(window, 'localStorage', {
+                value: { getItem: function () { return null; }, setItem: function () { }, removeItem: function () { }, clear: function () { } },
+                writable: false
+            });
+        } catch (e) { }
+
+        // ─── Состояние ───────────────────────────────────────────────────
+        var socket = null;
+        var tradeMode = 'paper';
+
+        // Данные по монетам: symbol -> {price, vol24h, volat, vpin, imbalance, er, oteDist, retrPct, modelProba, hasSignal, inPosition, warmupPct, status, entryPrice, sl, tp, pnl, scanData}
+        var coinData = {};
+        // Открытые позиции: symbol -> {side, entry, sl, tp, pnl, reason}
+        var positions = {};
+        // Общий PnL
+        var totalPnl = 0;
+        // Сортировка таблицы
+        var sortCol = 'oteDist';
+        var sortDir = 'asc';
+
+        // ─── Socket.IO ───────────────────────────────────────────────────
+        function connectSocket() {
+            if (socket && socket.connected) return;
+            var url = (window.location.protocol === 'file:') ? 'http://localhost:5000' : window.location.origin;
+            socket = io(url, {
+                transports: ['polling'], upgrade: false,
+                reconnectionDelay: 1000, reconnectionDelayMax: 8000,
+                reconnectionAttempts: Infinity, timeout: 20000,
+                withCredentials: false, auth: {}, forceNew: false
+            });
+
+            socket.on('connect', function () {
+                var el = document.getElementById('connStatus');
+                el.innerHTML = '&#9679; LIVE'; el.className = 'ok';
+                log('[CONN] Подключено к серверу', 'c-g');
+            });
+            socket.on('disconnect', function () {
+                var el = document.getElementById('connStatus');
+                el.innerHTML = '&#9679; OFFLINE'; el.className = 'err';
+                log('[CONN] Отключено', 'c-r');
+            });
+            socket.on('multi_bucket_info', function (data) {
+                // data: { 'BTCUSDT.BINANCE': 200000, ... }
+                Object.keys(data).forEach(function (instId) {
+                    var sym = instId.split('.')[0];
+                    if (!coinData[sym]) coinData[sym] = {};
+                    coinData[sym].bucket = data[instId];
+                });
+                renderTable();
+            });
+
+            // ── Статус стратегии ──
+            socket.on('strategy_status', function (d) {
+                var st = document.getElementById('scannerStatus');
+                if (d.status === 'loading') {
+                    st.textContent = 'ЗАГРУЗКА ' + d.symbol + ' (' + (d.index + 1) + '/' + d.total + ')';
+                    st.className = 'status-text loading';
+                    updateProgress((d.index + 1) / d.total * 100);
+                    log('[LOAD] ' + d.symbol + ' (' + (d.index + 1) + '/' + d.total + ')', 'c-y');
+                } else if (d.status === 'running') {
+                    var count = d.symbols ? d.symbols.length : Object.keys(coinData).length;
+                    st.textContent = 'МОНИТОРИНГ ' + count + ' МОНЕТ';
+                    st.className = 'status-text active';
+                    updateProgress(100);
+                    document.getElementById('vCoins').textContent = count;
+                    log('[SCAN] Сканер запущен — ' + count + ' монет', 'c-g');
+                    document.getElementById('btnScan').disabled = false;
+                    document.getElementById('btnScan').textContent = 'РЕСКАН';
+                } else if (d.status === 'idle') {
+                    st.textContent = 'IDLE — нажмите СТАРТ СКАН';
+                    st.className = 'status-text';
+                    document.getElementById('btnScan').disabled = false;
+                } else if (d.status === 'error') {
+                    st.textContent = 'ОШИБКА: ' + (d.error || 'unknown');
+                    st.className = 'status-text'; st.style.color = '#ff073a';
+                    log('[ERR] ' + (d.error || 'Неизвестная ошибка'), 'c-r');
+                    document.getElementById('btnScan').disabled = false;
+                }
+            });
+
+            // ── Метрики по закрытому пакету ──
+            socket.on('metrics', function (m) {
+                var sym = m.symbol;
+                if (!coinData[sym]) coinData[sym] = { symbol: sym };
+                var c = coinData[sym];
+
+                if (m.vol24h) c.vol24h = m.vol24h;
+                if (m.bucket) c.bucket = m.bucket;
+                c.imbalance = m.imbalance;
+                c.vpin = m.vpin;
+                c.er = m.er;
+                c.oteDist = m.ote_distance;
+                c.retrPct = m.retracement_pct;
+                c.warmupPct = m.warmup_pct;
+                c.hasSignal = m.has_signal;
+                c.inPosition = m.in_position;
+                c.modelProba = m.model_proba;
+
+                if (m.has_signal) {
+                    c.entryPrice = m.entry_705 || m.entry_price;
+                    c.oteHigh = m.ote_high;
+                    c.oteLow = m.ote_low;
+                    c.structSl = m.structural_sl;
+                    c.structTp = m.structural_tp;
+                } else {
+                    c.oteHigh = null;
+                    c.oteLow = null;
+                }
+
+                if (m.paper_pnl !== undefined) {
+                    c.pnl = m.paper_pnl;
+                }
+
+                // Вычисляем статус
+                c.status = computeStatus(c);
+                renderTable();
+                updateCounters();
+            });
+
+            // ── Живая незакрытая свеча ──
+            socket.on('partial', function (p) {
+                var sym = p.symbol;
+                if (!coinData[sym]) coinData[sym] = { symbol: sym };
+                coinData[sym].price = p.close;
+                coinData[sym].fillPct = p.fill_pct;
+                if (p.imbalance !== undefined) coinData[sym].imbalance = p.imbalance;
+                if (p.vpin !== undefined) coinData[sym].vpin = p.vpin;
+                if (p.ote_distance !== undefined) coinData[sym].oteDist = p.ote_distance;
+                if (p.retracement_pct !== undefined) coinData[sym].retrPct = p.retracement_pct;
+                renderTable();
+            });
+
+            // ── Сигналы входа/выхода ──
+            socket.on('signal', function (d) {
+                var sym = d.symbol;
+                if (d.action === 'enter') {
+                    positions[sym] = {
+                        side: 'LONG', entry: d.price,
+                        sl: d.sl, tp: d.tp, pnl: 0
+                    };
+                    if (coinData[sym]) {
+                        coinData[sym].inPosition = true;
+                        coinData[sym].status = 'enter';
+                    }
+                    log('[ВХОД] ' + sym + ' LONG @ ' + d.price.toFixed(4) + ' | SL: ' + d.sl.toFixed(4) + ' | TP: ' + d.tp.toFixed(4), 'c-g');
+                } else if (d.action === 'limit') {
+                    positions[sym] = {
+                        is_limit: true,
+                        side: 'LIMIT', entry: d.price,
+                        sl: d.sl, tp: d.tp, pnl: 0,
+                        risk_pct: d.risk_pct,
+                        reward_pct: d.reward_pct,
+                        rr_ratio: d.rr_ratio
+                    };
+                    if (coinData[sym]) {
+                        coinData[sym].status = 'limit';
+                    }
+                    // log('[LIMIT] ' + sym + ' -> ' + positions[sym].side + ' at ' + d.price, 'c-y');
+                } else if (d.action === 'exit') {
+                    var reason = d.reason === 'tp' ? 'TP' : 'SL';
+                    var pnlCol = d.pnl >= 0 ? 'c-g' : 'c-r';
+                    log('[ВЫХОД] ' + sym + ' ' + reason + ' | PnL: ' + (d.pnl >= 0 ? '+' : '') + d.pnl.toFixed(2) + '$', pnlCol);
+
+                    delete positions[sym];
+                    if (coinData[sym]) {
+                        coinData[sym].inPosition = false;
+                        coinData[sym].status = d.reason === 'tp' ? 'tp' : 'sl';
+                        coinData[sym].pnl = d.total_pnl;
+                    }
+                    totalPnl = d.total_pnl || totalPnl;
+                }
+                renderPositions();
+                renderTable();
+                updateCounters();
+            });
+
+            // ── Сигналы из стратегии (текстовые логи) ──
+            socket.on('log_msg', function (d) {
+                log(d.msg, d.color || 'c-b');
+            });
+
+            // ── Прогресс загрузки истории ──
+            socket.on('hist_progress', function (d) {
+                var st = document.getElementById('scannerStatus');
+                st.textContent = 'ИСТОРИЯ ' + d.symbol + ': ' + d.msg;
+                st.className = 'status-text loading';
+                updateProgress(d.pct);
+            });
+
+            // ── Пропускаем candles_batch и candle — графика нет ──
+            socket.on('candles_batch', function () { });
+            socket.on('candle', function () { });
+        }
+
+        connectSocket();
+
+        // ─── Trade Mode ──────────────────────────────────────────────────
+        window.setTradeMode = function (mode) {
+            tradeMode = mode;
+            var dot = document.getElementById('modeDot');
+            dot.className = 'mode-dot ' + mode;
+            if (socket && socket.connected) {
+                socket.emit('set_trade_mode', { mode: mode });
+            }
+            log('[MODE] ' + mode.toUpperCase(), mode === 'paper' ? 'c-g' : 'c-r');
+        };
+
+        // ─── Scan ────────────────────────────────────────────────────────
+        window.startScan = async function () {
+            var btn = document.getElementById('btnScan');
+            btn.disabled = true; btn.textContent = 'СКАНИРУЮ...';
+            log('[SCAN] Запрос рыночных данных...');
+
+            try {
+                var apiBase = (window.location.protocol === 'file:') ? 'http://localhost:5000' : '';
+                var r = await fetch(apiBase + '/api/scan');
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                var data = await r.json();
+
+                var filtered = data.filter(function (t) {
+                    return t.symbol.endsWith('USDT');
+                });
+                filtered.sort(function (a, b) {
+                    var ra = (+a.highPrice - +a.lowPrice) / +a.openPrice;
+                    var rb = (+b.highPrice - +b.lowPrice) / +b.openPrice;
+                    return rb - ra;
+                });
+
+                var top = filtered.slice(0, 10);
+                var symbols = top.map(function (c) { return c.symbol; });
+
+                // Заполняем начальные данные из скана
+                top.forEach(function (t) {
+                    var sym = t.symbol;
+                    coinData[sym] = {
+                        symbol: sym,
+                        price: +t.lastPrice,
+                        vol24h: +t.quoteVolume,
+                        volat: ((+t.highPrice - +t.lowPrice) / +t.openPrice * 100),
+                        vpin: null, imbalance: null, er: null,
+                        oteDist: null, retrPct: null, modelProba: null,
+                        hasSignal: false, inPosition: false,
+                        warmupPct: 0, status: 'warmup',
+                        scanData: t
+                    };
+                });
+
+                renderTable();
+                document.getElementById('vCoins').textContent = symbols.length;
+                log('[SCAN] Найдено ' + filtered.length + ' пар. Мониторим топ-' + symbols.length);
+
+                if (socket && socket.connected) {
+                    socket.emit('start_strategy', { symbols: symbols });
+                } else {
+                    log('[ERR] Socket не подключён', 'c-r');
+                    btn.disabled = false; btn.textContent = 'СТАРТ СКАН';
+                }
+            } catch (e) {
+                log('[ERR] Скан: ' + e, 'c-r');
+                btn.disabled = false; btn.textContent = 'СТАРТ СКАН';
+            }
+        };
+
+        // ─── Compute Status ──────────────────────────────────────────────
+        function computeStatus(c) {
+            if (c.inPosition) return 'enter';
+            if (c.warmupPct !== undefined && c.warmupPct < 100) return 'warmup';
+            if (!c.hasSignal) return 'wait';
+
+            var dist = c.oteDist;
+            if (dist === null || dist === undefined) return 'wait';
+
+            // Если модель дала >= 50%, значит Сервер выставил Advance Limit
+            if (c.modelProba !== null && c.modelProba !== undefined && c.modelProba >= 0.50) {
+                return 'limit';
+            }
+
+            if (dist === 0) return 'zone';  // В зоне OTE (но модель еще против)
+            if (dist > 0 && dist <= 1.0) return 'near';  // Близко
+            return 'wait';
+        }
+
+        // ─── Render Coin Table ───────────────────────────────────────────
+        function renderTable() {
+            var tbody = document.getElementById('coinTableBody');
+            var keys = Object.keys(coinData);
+            if (keys.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="13" style="text-align:center; color:#333; padding:40px;">Нажмите СТАРТ СКАН для начала работы</td></tr>';
+                return;
+            }
+
+            // Сортировка
+            keys.sort(function (a, b) {
+                var ca = coinData[a], cb = coinData[b];
+                var va, vb;
+                switch (sortCol) {
+                    case 'symbol': va = a; vb = b; break;
+                    case 'price': va = ca.price || 0; vb = cb.price || 0; break;
+                    case 'vol24h': va = ca.vol24h || 0; vb = cb.vol24h || 0; break;
+                    case 'volat': va = ca.volat || 0; vb = cb.volat || 0; break;
+                    case 'vpin': va = ca.vpin || 0; vb = cb.vpin || 0; break;
+                    case 'imbalance': va = ca.imbalance || 0; vb = cb.imbalance || 0; break;
+                    case 'er': va = ca.er || 0; vb = cb.er || 0; break;
+                    case 'oteDist':
+                        va = ca.oteDist !== null && ca.oteDist !== undefined ? ca.oteDist : 9999;
+                        vb = cb.oteDist !== null && cb.oteDist !== undefined ? cb.oteDist : 9999;
+                        break;
+                    case 'model': va = ca.modelProba || 0; vb = cb.modelProba || 0; break;
+                    case 'status':
+                        var order = { enter: 0, zone: 1, near: 2, warmup: 3, wait: 4, tp: 5, sl: 6, skip: 7 };
+                        va = order[ca.status] !== undefined ? order[ca.status] : 99;
+                        vb = order[cb.status] !== undefined ? order[cb.status] : 99;
+                        break;
+                    default: va = 0; vb = 0;
+                }
+                if (typeof va === 'string') {
+                    return sortDir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
+                }
+                return sortDir === 'asc' ? va - vb : vb - va;
+            });
+
+            var html = '';
+            keys.forEach(function (sym) {
+                var c = coinData[sym];
+                var rowClass = '';
+                if (c.status === 'enter') rowClass = 'entered';
+                else if (c.status === 'zone') rowClass = 'in-zone';
+
+                var priceStr = c.price ? fmtPrice(c.price) : '—';
+                var volStr = c.vol24h ? fmtVolume(c.vol24h) : '—';
+                var bucketStr = c.bucket ? c.bucket >= 1000000 ? (c.bucket / 1000000).toFixed(1) + 'M' : (c.bucket / 1000).toFixed(0) + 'k' : '—';
+
+                var volatStr = c.volat !== null && c.volat !== undefined ? c.volat.toFixed(1) + '%' : '—';
+                var vpinStr = c.vpin !== null && c.vpin !== undefined ? c.vpin.toFixed(1) + '%' : '—';
+                var vpinClass = c.vpin > 60 ? 'c-r' : c.vpin > 40 ? 'c-y' : '';
+                var imbStr = c.imbalance !== null && c.imbalance !== undefined ? (c.imbalance >= 0 ? '+' : '') + c.imbalance.toFixed(1) + '%' : '—';
+                var imbClass = c.imbalance > 0 ? 'c-g' : c.imbalance < 0 ? 'c-r' : '';
+                var erStr = c.er !== null && c.er !== undefined ? c.er.toFixed(0) + '%' : '—';
+                var erClass = c.er >= 60 ? 'c-g' : c.er < 40 ? 'c-r' : 'c-y';
+                var oteStr = c.oteDist !== null && c.oteDist !== undefined ? (c.oteDist === 0 ? 'В ЗОНЕ' : c.oteDist.toFixed(2) + '%') : '—';
+                var oteClass = c.oteDist === 0 ? 'c-y' : c.oteDist !== null && c.oteDist <= 1 ? 'c-y' : '';
+
+                var oteHighStr = c.oteHigh ? fmtPrice(c.oteHigh) : '—';
+                var oteLowStr = c.oteLow ? fmtPrice(c.oteLow) : '—';
+
+                var modelStr = c.modelProba !== null && c.modelProba !== undefined ? (c.modelProba * 100).toFixed(0) + '%' : '—';
+                var modelClass = c.modelProba >= 0.6 ? 'c-g' : '';
+                var badgeHtml = statusBadge(c.status, c.warmupPct);
+
+                html += '<tr class="' + rowClass + '">' +
+                    '<td style="font-weight:bold; color:#fff;">' + sym.replace('USDT', '') + '<span style="color:#444">/USDT</span></td>' +
+                    '<td class="td-right">' + priceStr + '</td>' +
+                    '<td class="td-right">' + volStr + '</td>' +
+                    '<td class="td-right" style="color:#a6e22e;">' + bucketStr + '</td>' +
+                    '<td class="td-right">' + volatStr + '</td>' +
+                    '<td class="td-right ' + vpinClass + '">' + vpinStr + '</td>' +
+                    '<td class="td-right ' + imbClass + '">' + imbStr + '</td>' +
+                    '<td class="td-right ' + erClass + '">' + erStr + '</td>' +
+                    '<td class="td-right ' + oteClass + '">' + oteStr + '</td>' +
+                    '<td class="td-right">' + oteHighStr + '</td>' +
+                    '<td class="td-right">' + oteLowStr + '</td>' +
+                    '<td class="td-right ' + modelClass + '">' + modelStr + '</td>' +
+                    '<td>' + badgeHtml + '</td>' +
+                    '</tr>';
+            });
+            tbody.innerHTML = html;
+        }
+
+        // ─── Render Positions ────────────────────────────────────────────
+        function renderPositions() {
+            var posSection = document.getElementById('positionsSection');
+            var posBody = document.getElementById('positionsBody');
+            var keys = Object.keys(positions);
+
+            var html = '';
+            var activeCount = 0;
+
+            keys.forEach(function (sym) {
+                var p = positions[sym];
+                var rr = '—';
+                activeCount++;
+
+                if (p.is_limit) {
+                    html += '<div class="pos-row">' +
+                        '<span class="pos-sym">' + sym + '</span>' +
+                        '<span class="pos-side long" style="background:#00e5ff; color:#000;">LIMIT </span><br>' +
+                        '<span class="pos-detail">В: <span>' + fmtPrice(p.entry) + '</span></span>' +
+                        '<span class="pos-detail">SL: <span style="color:#ff073a">' + fmtPrice(p.sl) + ' (-' + p.risk_pct.toFixed(1) + '%)</span></span><br>' +
+                        '<span class="pos-detail" style="margin-left: 0;">TP: <span style="color:#39ff14">' + fmtPrice(p.tp) + ' (+' + p.reward_pct.toFixed(1) + '%)</span></span>' +
+                        '<span class="pos-detail">R:R <span>1:' + p.rr_ratio + '</span></span>' +
+                        '</div>';
+                } else {
+                    if (p.entry && p.sl && p.tp) {
+                        var risk = Math.abs(p.entry - p.sl);
+                        var reward = Math.abs(p.tp - p.entry);
+                        rr = risk > 0 ? '1:' + (reward / risk).toFixed(1) : '—';
+                    }
+                    var pnlVal = p.pnl || 0;
+                    var pnlClass = pnlVal >= 0 ? 'c-g' : 'c-r';
+
+                    html += '<div class="pos-row">' +
+                        '<span class="pos-sym">' + sym + '</span>' +
+                        '<span class="pos-side long">' + p.side + '</span><br>' +
+                        '<span class="pos-detail">В: <span>' + fmtPrice(p.entry) + '</span></span>' +
+                        '<span class="pos-detail">SL: <span style="color:#ff073a">' + fmtPrice(p.sl) + '</span></span><br>' +
+                        '<span class="pos-detail" style="margin-left: 0;">TP: <span style="color:#39ff14">' + fmtPrice(p.tp) + '</span></span>' +
+                        '<span class="pos-detail">R:R <span>' + rr + '</span></span>' +
+                        '<span class="pos-pnl ' + pnlClass + '">' + (pnlVal >= 0 ? '+' : '') + pnlVal.toFixed(2) + '$</span>' +
+                        '</div>';
+                }
+            });
+
+            posBody.innerHTML = html;
+            posSection.style.display = activeCount > 0 ? 'flex' : 'none';
+        }
+
+        // ─── Update Counters ─────────────────────────────────────────────
+        function updateCounters() {
+            var setups = 0;
+            Object.keys(coinData).forEach(function (sym) {
+                if (coinData[sym].hasSignal) setups++;
+            });
+            document.getElementById('vSetups').textContent = setups;
+            document.getElementById('vCoins').textContent = Object.keys(coinData).length;
+
+            // PnL
+            var pnl = 0;
+            Object.keys(coinData).forEach(function (sym) {
+                if (coinData[sym].pnl) pnl += coinData[sym].pnl;
+            });
+            var pnlEl = document.getElementById('vPnl');
+            pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + '$';
+            pnlEl.className = 'stat-value ' + (pnl >= 0 ? 'c-g' : 'c-r');
+
+            // Wallet Balance
+            var initialWallet = 10000.00;
+            var currentWallet = initialWallet + pnl;
+            var walletEl = document.getElementById('vWallet');
+            walletEl.textContent = currentWallet.toFixed(2) + ' $';
+            walletEl.className = 'stat-value ' + (currentWallet >= initialWallet ? 'c-g' : 'c-r');
+        }
+
+        // ─── Helpers ─────────────────────────────────────────────────────
+        function fmtPrice(p) {
+            if (!p) return '—';
+            if (p >= 1000) return p.toFixed(2);
+            if (p >= 1) return p.toFixed(4);
+            return p.toFixed(6);
+        }
+
+        function fmtVolume(v) {
+            if (v >= 1e9) return (v / 1e9).toFixed(1) + 'B';
+            if (v >= 1e6) return (v / 1e6).toFixed(0) + 'M';
+            if (v >= 1e3) return (v / 1e3).toFixed(0) + 'K';
+            return v.toFixed(0);
+        }
+
+        function statusBadge(status, warmupPct) {
+            switch (status) {
+                case 'wait': return '<span class="badge badge-wait">ЗОНА НЕ НАЙДЕНА</span>';
+                case 'limit': return '<span class="badge badge-near" style="color:#00e5ff; border-color:#00e5ff;">ОЖИД. LIMIT</span>';
+                case 'near': return '<span class="badge badge-near">БЛИЗКО</span>';
+                case 'zone': return '<span class="badge badge-zone">В ЗОНЕ</span>';
+                case 'enter': return '<span class="badge badge-enter">ВХОД</span>';
+                case 'tp': return '<span class="badge badge-tp">TP</span>';
+                case 'sl': return '<span class="badge badge-sl">SL</span>';
+                case 'skip': return '<span class="badge badge-skip">ПРОПУСК</span>';
+                case 'warmup': return '<span class="badge badge-warmup">WARMUP ' + (warmupPct || 0).toFixed(0) + '%</span>';
+                default: return '<span class="badge badge-wait">—</span>';
+            }
+        }
+
+        function updateProgress(pct) {
+            var fill = document.getElementById('progressFill');
+            fill.style.width = Math.max(0, Math.min(100, pct)) + '%';
+            if (pct >= 100) {
+                setTimeout(function () { fill.style.width = '0%'; }, 2000);
+            }
+        }
+
+        function log(msg, cls) {
+            var el = document.createElement('div');
+            el.className = 'log-entry';
+            var time = new Date().toLocaleTimeString('ru-RU');
+            el.innerHTML = '<span class="log-time">' + time + '</span>' +
+                (cls ? '<span class="' + cls + '">' + msg + '</span>' : msg);
+            var body = document.getElementById('logBody');
+            body.prepend(el);
+            while (body.children.length > 100) body.removeChild(body.lastChild);
+        }
+
+        // ─── Table Sorting ───────────────────────────────────────────────
+        document.querySelectorAll('th[data-sort]').forEach(function (th) {
+            th.addEventListener('click', function () {
+                var col = this.dataset.sort;
+                if (sortCol === col) {
+                    sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+                } else {
+                    sortCol = col;
+                    sortDir = 'asc';
+                }
+                // Update header classes
+                document.querySelectorAll('th[data-sort]').forEach(function (h) {
+                    h.classList.remove('sorted-asc', 'sorted-desc');
+                });
+                this.classList.add(sortDir === 'asc' ? 'sorted-asc' : 'sorted-desc');
+                renderTable();
+            });
+        });
+
+        // ─── Init ────────────────────────────────────────────────────────
+        document.getElementById('connStatus').innerHTML = '&#9679; CONNECTING';
+        log('Дашборд SMC Screener запущен.');
+    </script>
+</body>
+
+</html>
