@@ -21,9 +21,9 @@ def detect_ote_signal(df: pd.DataFrame, swing_length: int = 50, lag: int = 50) -
             swing_low     : Point A — корень импульса (Invalidation / SL уровень)
             swing_high    : Point B — пик импульса (Liquidity / TP уровень)
             range_size    : swing_high - swing_low
-            ote_high      : swing_low + range_size * 0.382  (61.8% ретрейс — верхняя граница)
-            ote_low       : swing_low + range_size * 0.210  (79.0% ретрейс — нижняя граница)
-            entry_price   : swing_low + range_size * 0.295 (70.5% откат = Sweet Spot)
+            ote_high      : bos_high - range_size * 0.62  (62% ретрейс — верхняя граница)
+            ote_low       : bos_high - range_size * 0.79  (79% ретрейс — нижняя граница)
+            entry_price   : bos_high - range_size * 0.705 (70.5% откат = Sweet Spot)
             tp_conservative: swing_high
             tp_standard   : swing_high + range_size * 0.27
             tp_aggressive : swing_high + range_size * 0.618
@@ -47,7 +47,9 @@ def detect_ote_signal(df: pd.DataFrame, swing_length: int = 50, lag: int = 50) -
     if valid_idx_limit < 1:
         return None
 
-    # Ищем последний подтверждённый бычий BOS
+    # Ищем последний подтверждённый БЫЧИЙ BOS
+    # Нам не важно, были ли после него мелкие медвежьи сломы, так как откат в зону OTE
+    # часто сопровождается локальными медвежьими сломами структуры на минутках.
     bos_list = bos[bos['BOS'] == 1].index.tolist()
     valid_bos = [i for i in bos_list if i <= valid_idx_limit]
 
@@ -57,44 +59,35 @@ def detect_ote_signal(df: pd.DataFrame, swing_length: int = 50, lag: int = 50) -
     bos_idx = valid_bos[-1]
 
     # ── ПРАВИЛЬНЫЙ DEALING RANGE ─────────────────────────────────────────
-    # Point B = Swing High перед/на bos_idx (пик перед откатом)
-    # Ищем последний Swing High ДО(включая) bos_idx
-    swing_highs = swing[swing['HighLow'] == 1].index.tolist()
+    # Point A = Swing Low перед/на bos_idx (корень импульса)
     swing_lows  = swing[swing['HighLow'] == -1].index.tolist()
+    sl_before = [i for i in swing_lows if i <= bos_idx]
 
-    # Swing High — последний максимум до и включая bos_idx
-    sh_before = [i for i in swing_highs if i <= bos_idx]
-    sl_before = [i for i in swing_lows  if i <= bos_idx]
-
-    if not sh_before or not sl_before:
-        print("[SMC DEBUG] Fallback удален: структура не найдена (нет sh_before или sl_before)")
+    if not sl_before:
+        # print("[SMC DEBUG] структура не найдена (нет sl_before)")
         return None
 
-    swing_high_idx = sh_before[-1]
     swing_low_idx  = sl_before[-1]
-
-    swing_high = float(recent['high'].iloc[swing_high_idx])
     swing_low  = float(recent['low'].iloc[swing_low_idx])
 
-    # Swing Low должен быть ДО Swing High (корень импульса)
-    if swing_low_idx >= swing_high_idx:
-        # Ищем Swing Low ДО Swing High
-        sl_before_sh = [i for i in swing_lows if i < swing_high_idx]
-        if sl_before_sh:
-            swing_low = float(recent['low'].iloc[sl_before_sh[-1]])
-        else:
-            print("[SMC DEBUG] Структура отменена: swing_low >= swing_high и нет предыдущих swing_lows")
-            return None
+    # Point B = АБСОЛЮТНЫЙ ПИК после Swing Low до текущего момента
+    highs_since_sl = recent['high'].iloc[swing_low_idx:]
+    swing_high = float(highs_since_sl.max())
+    swing_high_idx = highs_since_sl.idxmax()
+
+    # Если пик оказался самим корнем (невозможно, но мало ли)
+    if swing_high <= swing_low:
+        return None
 
     range_size = swing_high - swing_low
     if range_size <= 0:
-        print(f"[SMC DEBUG] Пропуск: range_size <= 0 ({range_size})")
+        # print(f"[SMC DEBUG] Пропуск: range_size <= 0 ({range_size})")
         return None
 
-    # ── ЗОНЫ ФИБОНАЧЧИ (откат сверху вниз) ──────────────────────────────
-    ote_high      = swing_low + range_size * 0.382
-    ote_low       = swing_low + range_size * 0.210
-    entry_price   = swing_low + range_size * 0.295
+    # ── ЗОНЫ ФИБОНАЧЧИ (откат сверху вниз — как в backtest) ─────────────
+    ote_high      = swing_high - range_size * 0.62
+    ote_low       = swing_high - range_size * 0.79
+    entry_price   = swing_high - range_size * 0.705
 
     tp_conservative = swing_high
     tp_standard     = swing_high + range_size * 0.27
@@ -103,6 +96,63 @@ def detect_ote_signal(df: pd.DataFrame, swing_length: int = 50, lag: int = 50) -
     stop_loss       = swing_low * (1 - 0.001)
 
     current_price = float(df['close'].iloc[-1])
+
+    # ── ПРОВЕРКА ИНВАЛИДАЦИИ СРАЗУ (САЙЛЕНТ) ──
+    # Чтобы интерфейс не "спамил" ошибками про сломанные зоны, мы отсеиваем их сразу здесь.
+    
+    # 1. Цена уже закрылась НА или НИЖЕ корня импульса (настоящий слом структуры)
+    #    FIX: было `<`, стало `<=` — если цена вернулась ровно к swing_low, импульс полностью отменён.
+    if current_price <= swing_low:
+        return None 
+    # 2. Слишком глубокий пробой (>5%)
+    if current_price < swing_low * 0.95:
+        return None
+
+    # 3. FIX: Цена НИЖЕ зоны OTE = зона уже пройдена (pump-dump паттерн)
+    #    Если цена упала ниже нижней границы OTE (79% Fib), значит это не ретрейсмент,
+    #    а полный разворот. Нет смысла ждать отскок.
+    if current_price < ote_low:
+        return None
+
+    # ── ФИЛЬТР MITIGATED / STALE ЗОН (ЗАПИЛ) ──
+    # Как просил юзер: двигаемся хронологически от хая до текущей цены
+    # и смотрим, не была ли зона уже протестирована и отработана.
+    recent_highs = recent['high'].iloc[swing_low_idx:]
+    actual_swing_high_idx = recent_highs.idxmax()
+    
+    # Срез пакетов ПОСЛЕ достижения Swing High
+    post_high = recent.iloc[actual_swing_high_idx:]
+    
+    # Ищем момент первого касания точки входа (70.5%)
+    entered_mask = post_high['low'] <= entry_price
+    if entered_mask.any():
+        first_entry_idx = entered_mask.idxmax()
+
+        # Срез пакетов ПОСЛЕ первого касания
+        post_entry = recent.iloc[first_entry_idx:-1]  # до, но не включая текущий пакет
+
+        if len(post_entry) > 0:
+            max_bounce = post_entry['high'].max()
+            min_after_entry = post_entry['low'].min()
+
+            # 1. Зона MITIGATED (Отработана): цена зашла в OTE и вышла вверх выше ote_high.
+            #    FIX: Было `max_bounce >= swing_high` (слишком строго — ждали возврат к хаю).
+            #    Правильно по SMC: если цена побывала в зоне (ниже entry_price) и
+            #    отскочила выше ote_high (верхняя граница OTE = 61.8%) — ликвидность собрана,
+            #    зона отработана. Повторный вход = ловушка.
+            if max_bounce >= ote_high:
+                return None
+
+            # 2. FIX: Зона ПРОБИТА ВНИЗ — цена вошла в OTE и провалилась ниже ote_low
+            #    Это значит импульс полностью отменён (pump-dump / полный разворот)
+            if min_after_entry < ote_low:
+                return None
+
+            # 3. Зона STALE (Протухла): цена застряла в зоне слишком долго.
+            #    200 пакетов — разумный тайм-аут (было 50 — слишком мало).
+            time_since_entry = len(post_high) - list(post_high.index).index(first_entry_idx)
+            if time_since_entry > 200:
+                return None
 
     # [ИСПРАВЛЕНИЕ] Мы больше не блокируем выдачу сигнала, если цена еще не в OTE.
     # Детектор просто возвращает структуру (Dealing Range).

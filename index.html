@@ -612,33 +612,59 @@
     </div>
 
     <script>
-        // ─── Подавление ошибок localStorage при file:// ───────────────────
+        // ─── Подавление ошибок при file:// ────────────────────────────────
         window.addEventListener('unhandledrejection', function (e) {
             var msg = (e.reason && e.reason.message) ? e.reason.message : String(e.reason || '');
-            if (msg.indexOf('storage') !== -1 || msg.indexOf('Storage') !== -1 || msg.indexOf('Access to') !== -1) {
+            if (msg.indexOf('storage') !== -1 || msg.indexOf('Access to') !== -1) {
                 e.preventDefault();
             }
         });
-        try {
-            Object.defineProperty(window, 'localStorage', {
-                value: { getItem: function () { return null; }, setItem: function () { }, removeItem: function () { }, clear: function () { } },
-                writable: false
-            });
-        } catch (e) { }
-
-        // ─── Состояние ───────────────────────────────────────────────────
+        // ─── Состояние ─────────────────────────────────────────────────
         var socket = null;
         var tradeMode = 'paper';
 
-        // Данные по монетам: symbol -> {price, vol24h, volat, vpin, imbalance, er, oteDist, retrPct, modelProba, hasSignal, inPosition, warmupPct, status, entryPrice, sl, tp, pnl, scanData}
+        // Данные по монетам
         var coinData = {};
-        // Открытые позиции: symbol -> {side, entry, sl, tp, pnl, reason}
+        // Активные позиции/лимитки: symbol -> {...}
         var positions = {};
         // Общий PnL
         var totalPnl = 0;
-        // Сортировка таблицы
+        // Сортировка
         var sortCol = 'oteDist';
         var sortDir = 'asc';
+
+        // ─── Оркестратор Скринера ───────────────────────────────────────
+        var scanQueue = [];          // очередь монет из топ-50 ожидающих проверки
+        var activeBatch = [];          // текущий батч (до 5 монет)
+        var BATCH_SIZE = 1;            // 1 монета для тестирования песочницы
+        var rescanTimer = null;        // интервал hourly rescan
+        var batchWarmupTimer = null;       // таймаут ожидания warmup батча
+        var BATCH_WARMUP_TIMEOUT = 15 * 60 * 1000; // 15 минут макс. на прогрев батча
+        var exitCleanupTimers = {};        // symbol -> таймер удаления после exit
+        var invalidZoneTimers = {};        // symbol -> таймер удаления инвалидированных зон
+
+        // ─── Персистентность ────────────────────────────────────────────
+        function saveState() {
+            try {
+                sessionStorage.setItem('smc_coinData', JSON.stringify(coinData));
+                sessionStorage.setItem('smc_positions', JSON.stringify(positions));
+                sessionStorage.setItem('smc_queue', JSON.stringify(scanQueue));
+                sessionStorage.setItem('smc_batch', JSON.stringify(activeBatch));
+            } catch (e) { }
+        }
+
+        function loadState() {
+            try {
+                var cd = sessionStorage.getItem('smc_coinData');
+                var ps = sessionStorage.getItem('smc_positions');
+                var sq = sessionStorage.getItem('smc_queue');
+                var ab = sessionStorage.getItem('smc_batch');
+                if (cd) coinData = JSON.parse(cd);
+                if (ps) positions = JSON.parse(ps);
+                if (sq) scanQueue = JSON.parse(sq);
+                if (ab) activeBatch = JSON.parse(ab);
+            } catch (e) { }
+        }
 
         // ─── Socket.IO ───────────────────────────────────────────────────
         function connectSocket() {
@@ -655,20 +681,103 @@
                 var el = document.getElementById('connStatus');
                 el.innerHTML = '&#9679; LIVE'; el.className = 'ok';
                 log('[CONN] Подключено к серверу', 'c-g');
+                // Запрашиваем snapshot с сервера для восстановления данных
+                socket.emit('request_state');
             });
+
             socket.on('disconnect', function () {
                 var el = document.getElementById('connStatus');
                 el.innerHTML = '&#9679; OFFLINE'; el.className = 'err';
                 log('[CONN] Отключено', 'c-r');
             });
+
+            // ── Восстановление состояния со снапшота сервера ──
+            socket.on('state_snapshot', function (snap) {
+                if (!snap) return;
+                var coins = snap.coins || {};
+                var coinCount = Object.keys(coins).length;
+
+                // Если сервер только что перезапустился (running=false, монет нет) —
+                // сбрасываем старые данные браузера чтобы не было наложений
+                if (!snap.running && coinCount === 0) {
+                    if (Object.keys(coinData).length > 0) {
+                        log('[RESET] Сервер перезапущен — сбрасываем старые данные', 'c-y');
+                        coinData = {};
+                        positions = {};
+                        scanQueue = [];
+                        activeBatch = [];
+                        totalPnl = 0;
+                        try { sessionStorage.clear(); } catch (e) { }
+                        renderTable();
+                        renderPositions();
+                        updateCounters();
+                    }
+                    return;
+                }
+
+                // Сервер работает и есть данные — мержим снапшот
+                var restored = 0;
+                Object.keys(coins).forEach(function (sym) {
+                    var entry = coins[sym];
+                    if (entry.metrics) {
+                        var m = entry.metrics;
+                        if (!coinData[sym]) coinData[sym] = { symbol: sym };
+                        var c = coinData[sym];
+                        if (m.vol24h) c.vol24h = m.vol24h;
+                        if (m.bucket) c.bucket = m.bucket;
+                        c.imbalance = m.imbalance;
+                        c.vpin = m.vpin;
+                        c.er = m.er;
+                        c.oteDist = m.ote_distance;
+                        c.retrPct = m.retracement_pct;
+                        c.warmupPct = m.warmup_pct;
+                        c.hasSignal = m.has_signal;
+                        c.inPosition = m.in_position;
+                        c.modelProba = m.model_proba;
+                        if (m.has_signal) {
+                            c.entryPrice = m.entry_705 || m.entry_price;
+                            c.oteHigh = m.ote_high;
+                            c.oteLow = m.ote_low;
+                            c.structSl = m.structural_sl;
+                            c.structTp = m.structural_tp;
+                        }
+                        if (m.paper_pnl !== undefined) c.pnl = m.paper_pnl;
+                        c.status = computeStatus(c);
+                        restored++;
+                    }
+                    if (entry.signal) {
+                        var sig = entry.signal;
+                        var action = sig.action;
+                        if ((action === 'limit' || action === 'enter') && !positions[sym]) {
+                            positions[sym] = {
+                                is_limit: action === 'limit',
+                                side: action === 'limit' ? 'LIMIT' : 'LONG',
+                                entry: sig.price, sl: sig.sl, tp: sig.tp, pnl: 0,
+                                risk_pct: sig.risk_pct, reward_pct: sig.reward_pct,
+                                rr_ratio: sig.rr_ratio
+                            };
+                            if (coinData[sym]) coinData[sym].status = action;
+                        }
+                    }
+                });
+                if (restored > 0) {
+                    log('[RESTORE] Восстановлено ' + restored + ' монет из снапшота', 'c-b');
+                    renderTable();
+                    renderPositions();
+                    updateCounters();
+                    saveState();
+                }
+            });
+
+
             socket.on('multi_bucket_info', function (data) {
-                // data: { 'BTCUSDT.BINANCE': 200000, ... }
                 Object.keys(data).forEach(function (instId) {
                     var sym = instId.split('.')[0];
                     if (!coinData[sym]) coinData[sym] = {};
                     coinData[sym].bucket = data[instId];
                 });
                 renderTable();
+                saveState();
             });
 
             // ── Статус стратегии ──
@@ -685,9 +794,11 @@
                     st.className = 'status-text active';
                     updateProgress(100);
                     document.getElementById('vCoins').textContent = count;
-                    log('[SCAN] Сканер запущен — ' + count + ' монет', 'c-g');
-                    document.getElementById('btnScan').disabled = false;
+                    log('[SCAN] Батч запущен — ' + count + ' монет', 'c-g');
                     document.getElementById('btnScan').textContent = 'РЕСКАН';
+                    document.getElementById('btnScan').disabled = false;
+                    // Запускаем таймаут ожидания warmup
+                    scheduleBatchWarmupCheck();
                 } else if (d.status === 'idle') {
                     st.textContent = 'IDLE — нажмите СТАРТ СКАН';
                     st.className = 'status-text';
@@ -697,13 +808,22 @@
                     st.className = 'status-text'; st.style.color = '#ff073a';
                     log('[ERR] ' + (d.error || 'Неизвестная ошибка'), 'c-r');
                     document.getElementById('btnScan').disabled = false;
+                    // Всё равно пробуем следующий батч, если очередь не пуста
+                    onBatchDone();
                 }
             });
 
             // ── Метрики по закрытому пакету ──
             socket.on('metrics', function (m) {
                 var sym = m.symbol;
-                if (!coinData[sym]) coinData[sym] = { symbol: sym };
+
+                // Если монеты нет в coinData (уже удалена) — всё равно вызываем
+                // checkBatchWarmup(), иначе если все монеты батча удалятся, цикл зависнет навсегда.
+                if (!coinData[sym]) {
+                    checkBatchWarmup();
+                    return;
+                }
+
                 var c = coinData[sym];
 
                 if (m.vol24h) c.vol24h = m.vol24h;
@@ -725,24 +845,30 @@
                     c.structSl = m.structural_sl;
                     c.structTp = m.structural_tp;
                 } else {
+                    c.entryPrice = null;
                     c.oteHigh = null;
                     c.oteLow = null;
+                    c.structSl = null;
+                    c.structTp = null;
                 }
+                if (m.paper_pnl !== undefined) c.pnl = m.paper_pnl;
 
-                if (m.paper_pnl !== undefined) {
-                    c.pnl = m.paper_pnl;
-                }
-
-                // Вычисляем статус
                 c.status = computeStatus(c);
+
+                // Проверяем прогрев батча: если все прогрелись — чистим и берём следующий
+                checkBatchWarmup();
                 renderTable();
                 updateCounters();
+                saveState();
             });
 
             // ── Живая незакрытая свеча ──
             socket.on('partial', function (p) {
                 var sym = p.symbol;
-                if (!coinData[sym]) coinData[sym] = { symbol: sym };
+
+                // Если монеты нет — она была удалена за инвалидацию. Не воскрешаем.
+                if (!coinData[sym]) return;
+
                 coinData[sym].price = p.close;
                 coinData[sym].fillPct = p.fill_pct;
                 if (p.imbalance !== undefined) coinData[sym].imbalance = p.imbalance;
@@ -774,29 +900,38 @@
                         reward_pct: d.reward_pct,
                         rr_ratio: d.rr_ratio
                     };
-                    if (coinData[sym]) {
-                        coinData[sym].status = 'limit';
-                    }
-                    // log('[LIMIT] ' + sym + ' -> ' + positions[sym].side + ' at ' + d.price, 'c-y');
+                    if (coinData[sym]) coinData[sym].status = 'limit';
                 } else if (d.action === 'exit') {
-                    var reason = d.reason === 'tp' ? 'TP' : 'SL';
-                    var pnlCol = d.pnl >= 0 ? 'c-g' : 'c-r';
-                    log('[ВЫХОД] ' + sym + ' ' + reason + ' | PnL: ' + (d.pnl >= 0 ? '+' : '') + d.pnl.toFixed(2) + '$', pnlCol);
-
-                    delete positions[sym];
-                    if (coinData[sym]) {
-                        coinData[sym].inPosition = false;
-                        coinData[sym].status = d.reason === 'tp' ? 'tp' : 'sl';
-                        coinData[sym].pnl = d.total_pnl;
+                    // reason: 'tp' | 'sl' | 'canc' (лимитка отменена — цена ушла без нас)
+                    if (d.reason === 'canc') {
+                        log('[ПРОПУСК] ' + sym + ' — лимитка отменена, цена ушла без нас', 'c-y');
+                        delete positions[sym];
+                        if (coinData[sym]) {
+                            coinData[sym].inPosition = false;
+                            coinData[sym].status = 'skip';  // отдельный статус — не SL!
+                        }
+                        scheduleExitCleanup(sym);
+                    } else {
+                        var reason = d.reason === 'tp' ? 'TP' : 'SL';
+                        var pnlCol = d.pnl >= 0 ? 'c-g' : 'c-r';
+                        log('[ВЫХОД] ' + sym + ' ' + reason + ' | PnL: ' + (d.pnl >= 0 ? '+' : '') + d.pnl.toFixed(2) + '$', pnlCol);
+                        delete positions[sym];
+                        if (coinData[sym]) {
+                            coinData[sym].inPosition = false;
+                            coinData[sym].status = d.reason === 'tp' ? 'tp' : 'sl';
+                            coinData[sym].pnl = d.total_pnl;
+                        }
+                        totalPnl = d.total_pnl || totalPnl;
+                        scheduleExitCleanup(sym);
                     }
-                    totalPnl = d.total_pnl || totalPnl;
                 }
                 renderPositions();
                 renderTable();
                 updateCounters();
+                saveState();
             });
 
-            // ── Сигналы из стратегии (текстовые логи) ──
+            // ── Текстовые логи из стратегии ──
             socket.on('log_msg', function (d) {
                 log(d.msg, d.color || 'c-b');
             });
@@ -809,11 +944,27 @@
                 updateProgress(d.pct);
             });
 
-            // ── Пропускаем candles_batch и candle — графика нет ──
+            // ── batch_done: сервер завершил воркер — готов к следующему батчу ──
+            socket.on('batch_done', function (d) {
+                log('[SCAN] Сервер: батч завершён (' + (d.symbols || []).join(', ') + '). Проверяем зоны...', 'c-b');
+                // Принудительно вызываем проверку — некоторые монеты могут не дать warmupPct=100
+                if (activeBatch.length > 0) {
+                    onBatchDone();
+                }
+            });
+
             socket.on('candles_batch', function () { });
             socket.on('candle', function () { });
         }
 
+        // ─── Загружаем сохранённое состояние ────────────────────────────
+        loadState();
+        if (Object.keys(coinData).length > 0) {
+            renderTable();
+            renderPositions();
+            updateCounters();
+            log('[RESTORE] Данные восстановлены из sessionStorage (' + Object.keys(coinData).length + ' монет)', 'c-b');
+        }
         connectSocket();
 
         // ─── Trade Mode ──────────────────────────────────────────────────
@@ -821,39 +972,39 @@
             tradeMode = mode;
             var dot = document.getElementById('modeDot');
             dot.className = 'mode-dot ' + mode;
-            if (socket && socket.connected) {
-                socket.emit('set_trade_mode', { mode: mode });
-            }
+            if (socket && socket.connected) socket.emit('set_trade_mode', { mode: mode });
             log('[MODE] ' + mode.toUpperCase(), mode === 'paper' ? 'c-g' : 'c-r');
         };
 
-        // ─── Scan ────────────────────────────────────────────────────────
-        window.startScan = async function () {
-            var btn = document.getElementById('btnScan');
-            btn.disabled = true; btn.textContent = 'СКАНИРУЮ...';
-            log('[SCAN] Запрос рыночных данных...');
+        // ─── Оркестратор Скринера (Batch Mode) ──────────────────────────
+        //
+        //  Логика:
+        //  1. startScan() → берёт топ-50 монет из /api/scan → кладёт в scanQueue
+        //  2. launchNextBatch() → берёт первые 10 из scanQueue → отправляет start_strategy
+        //  3. Когда все 10 прогрелись (warmupPct=100) → pruneNonZoneCoins() → launchNextBatch()
+        //  4. Монеты без зон (status=wait, нет лимитки/позиции) убираются из coinData
+        //  5. Каждый час: hourlyRescan() → добавляет новые монеты из очереди
+        //
 
-            try {
-                var apiBase = (window.location.protocol === 'file:') ? 'http://localhost:5000' : '';
-                var r = await fetch(apiBase + '/api/scan');
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                var data = await r.json();
+        // Запускает следующий батч из очереди
+        function launchNextBatch() {
+            if (batchWarmupTimer) { clearTimeout(batchWarmupTimer); batchWarmupTimer = null; }
 
-                var filtered = data.filter(function (t) {
-                    return t.symbol.endsWith('USDT');
-                });
-                filtered.sort(function (a, b) {
-                    var ra = (+a.highPrice - +a.lowPrice) / +a.openPrice;
-                    var rb = (+b.highPrice - +b.lowPrice) / +b.openPrice;
-                    return rb - ra;
-                });
+            if (scanQueue.length === 0) {
+                log('[SCAN] Очередь пуста. Все монеты обработаны.', 'c-g');
+                var activeCount = Object.keys(coinData).length;
+                document.getElementById('scannerStatus').textContent = 'МОНИТОРИНГ ' + activeCount + ' МОНЕТ (зоны найдены)';
+                return;
+            }
 
-                var top = filtered.slice(0, 10);
-                var symbols = top.map(function (c) { return c.symbol; });
+            activeBatch = scanQueue.splice(0, BATCH_SIZE);
+            var symbols = activeBatch.map(function (t) { return t.symbol; });
+            log('[SCAN] Батч ' + symbols.join(', '), 'c-y');
 
-                // Заполняем начальные данные из скана
-                top.forEach(function (t) {
-                    var sym = t.symbol;
+            // Создаём записи в coinData для новых монет батча
+            activeBatch.forEach(function (t) {
+                var sym = t.symbol;
+                if (!coinData[sym]) {
                     coinData[sym] = {
                         symbol: sym,
                         price: +t.lastPrice,
@@ -862,21 +1013,137 @@
                         vpin: null, imbalance: null, er: null,
                         oteDist: null, retrPct: null, modelProba: null,
                         hasSignal: false, inPosition: false,
-                        warmupPct: 0, status: 'warmup',
-                        scanData: t
+                        warmupPct: 0, status: 'warmup', scanData: t
                     };
+                }
+            });
+
+            renderTable();
+            updateCounters();
+            saveState();
+
+            if (socket && socket.connected) {
+                socket.emit('start_strategy', { symbols: symbols });
+            } else {
+                log('[ERR] Socket не подключён', 'c-r');
+            }
+        }
+
+        // Проверяет прогрев текущего батча — если все прогрелись → чистим → следующий
+        function checkBatchWarmup() {
+            if (activeBatch.length === 0) return;
+            var allWarmed = activeBatch.every(function (t) {
+                var c = coinData[t.symbol];
+                // Если монеты уже нет (удалили по статусу wait) — считаем прогретой для целей батча
+                if (!c) return true;
+                return (c.warmupPct >= 100 || c.status === 'wait' || c.status === 'zone' ||
+                    c.status === 'limit' || c.status === 'enter' || c.status === 'near');
+            });
+            if (allWarmed) onBatchDone();
+        }
+
+        // Вызывается когда батч прогрелся или истёк таймаут
+        function onBatchDone() {
+            if (activeBatch.length === 0) return;
+            // Убрано pruneNonZoneCoins(); по желанию пользователя - все монеты остаются в таблице
+            activeBatch = [];
+            saveState();
+            if (scanQueue.length > 0) {
+                log('[SCAN] Осталось ' + scanQueue.length + ' монет в очереди. Следующий батч...', 'c-y');
+                setTimeout(launchNextBatch, 2000); // небольшая пауза между батчами
+            } else {
+                log('[SCAN] Все батчи обработаны. Активных монет: ' + Object.keys(coinData).length, 'c-g');
+                var st = document.getElementById('scannerStatus');
+                st.textContent = 'МОНИТОРИНГ ' + Object.keys(coinData).length + ' МОНЕТ';
+                st.className = 'status-text active';
+            }
+        }
+
+        // Устанавливает таймаут на случай если warmup не завершится сам
+        function scheduleBatchWarmupCheck() {
+            if (batchWarmupTimer) clearTimeout(batchWarmupTimer);
+            batchWarmupTimer = setTimeout(function () {
+                if (activeBatch.length > 0) {
+                    log('[SCAN] Таймаут прогрева батча — переходим к следующему', 'c-y');
+                    onBatchDone();
+                }
+            }, BATCH_WARMUP_TIMEOUT);
+        }
+
+
+
+        // Таймер очистки после TP/SL — убираем монету из panels если долго нет сигнала
+        function scheduleExitCleanup(sym) {
+            if (exitCleanupTimers[sym]) clearTimeout(exitCleanupTimers[sym]);
+            exitCleanupTimers[sym] = setTimeout(function () {
+                var c = coinData[sym];
+                if (!c) return;
+                // Если за 60 сек не появился новый сигнал
+                if (!c.inPosition && !c.hasSignal && !positions[sym]) {
+                    log('[CLEAN] ' + sym + ' — зона отработала, убрана из панели', 'c-y');
+                    c.status = 'wait'; // сбрасываем tp/sl статус
+                }
+                delete exitCleanupTimers[sym];
+                renderTable();
+            }, 60000);
+        }
+
+        // Hourly rescan — добавляем новые монеты из очереди (если очередь не пуста)
+        function hourlyRescan() {
+            log('[RESCAN] Плановый ресканирование зон...', 'c-b');
+            if (scanQueue.length > 0 && activeBatch.length === 0) {
+                launchNextBatch();
+            } else {
+                log('[RESCAN] Активный батч или очередь пуста — пропускаем', 'c-b');
+            }
+        }
+
+        // ─── СТАРТ СКАН ──────────────────────────────────────────────────
+        window.startScan = async function () {
+            var btn = document.getElementById('btnScan');
+            btn.disabled = true; btn.textContent = 'СКАНИРУЮ...';
+            log('[SCAN] Запрос рыночных данных...');
+
+            // Останавливаем предыдущий hourly rescan
+            if (rescanTimer) { clearInterval(rescanTimer); rescanTimer = null; }
+
+            try {
+                var apiBase = (window.location.protocol === 'file:') ? 'http://localhost:5000' : '';
+                var r = await fetch(apiBase + '/api/scan');
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                var allCoins = await r.json();
+
+                // Защита от кривого ответа от Binance (например, пустого списка из-за бана IP)
+                if (!Array.isArray(allCoins)) {
+                    throw new Error('Ожидался массив монет, получено: ' + typeof (allCoins));
+                }
+
+                // Сервер уже отфильтровал USDT-пары с объёмом > 10M и вернул топ-50 по волатильности
+                // Берём только те, которых ещё нет в мониторинге
+                var activeSymbols = Object.keys(coinData);
+                var newCoins = allCoins.filter(function (t) {
+                    return activeSymbols.indexOf(t.symbol) === -1;
                 });
 
-                renderTable();
-                document.getElementById('vCoins').textContent = symbols.length;
-                log('[SCAN] Найдено ' + filtered.length + ' пар. Мониторим топ-' + symbols.length);
-
-                if (socket && socket.connected) {
-                    socket.emit('start_strategy', { symbols: symbols });
-                } else {
-                    log('[ERR] Socket не подключён', 'c-r');
-                    btn.disabled = false; btn.textContent = 'СТАРТ СКАН';
+                if (newCoins.length === 0) {
+                    log('[SCAN] Все монеты из топ-50 уже в мониторинге.', 'c-g');
+                    btn.disabled = false; btn.textContent = 'РЕСКАН';
+                    return;
                 }
+
+                // Наполняем очередь
+                scanQueue = newCoins;
+                activeBatch = [];
+
+                log('[SCAN] Найдено ' + allCoins.length + ' пар, ' + newCoins.length + ' новых. Батч по ' + BATCH_SIZE + '...', 'c-g');
+                saveState();
+
+                // Запускаем первый батч
+                launchNextBatch();
+
+                // Hourly rescan
+                rescanTimer = setInterval(hourlyRescan, 60 * 60 * 1000);
+
             } catch (e) {
                 log('[ERR] Скан: ' + e, 'c-r');
                 btn.disabled = false; btn.textContent = 'СТАРТ СКАН';
@@ -886,6 +1153,9 @@
         // ─── Compute Status ──────────────────────────────────────────────
         function computeStatus(c) {
             if (c.inPosition) return 'enter';
+            // Жестко фиксируем статус 'limit', если ордер уже выставлен (чтобы метрика дистанции не переписала его на wait)
+            if (positions[c.symbol] && positions[c.symbol].is_limit) return 'limit';
+
             if (c.warmupPct !== undefined && c.warmupPct < 100) return 'warmup';
             if (!c.hasSignal) return 'wait';
 

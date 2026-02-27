@@ -273,62 +273,103 @@ def fetch_historical_packets(
 
     current_ms = start_ms
     fetched_trades = 0
-    last_processed_id = -1
+    from_id = None
+    retries = 0
 
     while current_ms < now_ms:
-        end_time = min(current_ms + 3600_000, now_ms)
         try:
-            resp = session.get(
-                f"{base_url}/api/v3/aggTrades",
-                params={
-                    "symbol": raw_symbol,
-                    "startTime": current_ms,
-                    "endTime": end_time,
-                    "limit": 1000,
-                },
-                timeout=10,
-            )
+            params = {
+                "symbol": raw_symbol,
+                "limit": 1000,
+            }
+            if from_id:
+                params["fromId"] = from_id
+            else:
+                params["startTime"] = current_ms
+                params["endTime"] = min(current_ms + 3600_000, now_ms)
+
+            resp = session.get(f"{base_url}/api/v3/aggTrades", params=params, timeout=10)
+            
+            # --- DYNAMIC RATE LIMIT CONTROLLER ---
+            used_weight = int(resp.headers.get("x-mbx-used-weight-1m", 0))
+            if used_weight > 5000:
+                pct_calc = min(100.0, max(0.0, (current_ms - start_ms) / total_ms * 100))
+                msg = f"Лимит Binance ({used_weight}/6000). Пауза 10с..."
+                print(f"[HISTORY] {msg}")
+                if on_progress:
+                    on_progress(pct_calc, msg)
+                _time.sleep(10.0)
+
             resp.raise_for_status()
             trades = resp.json()
+            retries = 0  # Reset retries on success
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code in (429, 418):
+                retry_after = int(e.response.headers.get("Retry-After", 60))
+                pct_calc = min(100.0, max(0.0, (current_ms - start_ms) / total_ms * 100))
+                msg = f"Превышен лимит (429). Ждем {retry_after}с..."
+                print(f"[HISTORY] {msg}")
+                if on_progress:
+                    on_progress(pct_calc, msg)
+                _time.sleep(retry_after + 1)
+                continue
+            
+            retries += 1
+            if retries > 5:
+                print(f"[HISTORY] Permanent HTTP Error {e}. Aborting fetch.")
+                break
+                
+            print(f"[HISTORY] HTTP Error: {e}. Retrying {retries}/5 in 2s...")
+            _time.sleep(2.0)
+            continue
         except Exception as e:
-            print(f"[HISTORY] Warning: {e}. Retrying in 2s...")
+            retries += 1
+            if retries > 5:
+                print(f"[HISTORY] Permanent Error {e}. Aborting fetch.")
+                break
+                
+            print(f"[HISTORY] Warning: {e}. Retrying {retries}/5 in 2s...")
             _time.sleep(2.0)
             continue
 
         if not trades:
-            current_ms = end_time + 1
+            if from_id is None:
+                current_ms += 3600_000
+            else:
+                from_id = None # Reset if ID search yields nothing
             continue
 
-        # Собираем данные в сырые списки для быстрой сборки numpy массивов
+        done_early = False
         for t in trades:
-            trade_id = int(t["a"])
-            if trade_id <= last_processed_id:
-                continue
-
             ts_ms = int(t["T"])
-            if ts_ms <= now_ms:
-                prices_list.append(float(t["p"]))
-                quantities_list.append(float(t["q"]))
-                is_buyer_maker_list.append(bool(t["m"]))
-                timestamps_list.append(ts_ms * 1_000_000)
-                
-            last_processed_id = trade_id
+            if ts_ms > now_ms:
+                done_early = True
+                break
+            
+            prices_list.append(float(t["p"]))
+            quantities_list.append(float(t["q"]))
+            is_buyer_maker_list.append(bool(t["m"]))
+            timestamps_list.append(ts_ms * 1_000_000)
+            from_id = int(t["a"]) + 1
+            current_ms = ts_ms
 
         fetched_trades += len(trades)
         
-        # Если уперлись в лимит 1000, значит внутри этого окна еще есть сделки.
-        # "Склеиваем" по времени последней сделки.
-        if len(trades) == 1000:
-            current_ms = int(trades[-1]["T"])
-        else:
-            current_ms = end_time + 1
-
+        # Real-time progress (requested by user)
         elapsed_ms = current_ms - start_ms
         pct = min(100.0, max(0.0, elapsed_ms / total_ms * 100))
         if on_progress:
             on_progress(pct, f"Загрузка: {fetched_trades} сделок ({pct:.0f}%)")
 
-        _time.sleep(0.04)
+        if done_early:
+            break
+
+        # If we didn't fill the limit, we've caught up to the endTime
+        if len(trades) < 1000:
+            from_id = None
+            current_ms += 1 # Move past the endTime window
+
+        _time.sleep(0.01) # Small sleep to avoid rate limits but keep it fast
 
     print(f"[HISTORY] Fetch Done: {fetched_trades} trades. Compiling packets via Numba...")
     if on_progress:
@@ -351,6 +392,10 @@ def fetch_historical_packets(
             builder._history_buy_vols.append(o_buy[i])
             builder._history_sell_vols.append(o_sell[i])
             
+            # BUG 5 FIX: Генерируем репрезентативный набор цен для расчёта volatility.
+            # Без этого volatility = 0.0001 и модель XGBoost не может корректно предсказывать.
+            pkt_prices = [o_open[i], o_low[i], o_high[i], o_close[i]]
+            
             p = Packet(
                 timestamp=o_start[i],
                 end_timestamp=o_end[i],
@@ -363,12 +408,12 @@ def fetch_historical_packets(
                 buy_volume=o_buy[i],
                 sell_volume=o_sell[i],
                 trades_count=o_cnt[i],
-                prices=[],
+                prices=pkt_prices,
                 vpin=vpin_val
             )
             packets.append(p)
 
-    print(f"[HISTORY] Done: {fetched_trades} trades → {len(packets)} packets")
+    print(f"[HISTORY] Done: {fetched_trades} trades -> {len(packets)} packets")
     if on_progress:
         on_progress(100.0, f"History loaded: {len(packets)} packets")
     return packets, builder

@@ -1,0 +1,9 @@
+flask
+flask-socketio
+nautilus_trader
+pandas
+numpy
+xgboost
+pyyaml
+requests
+numba

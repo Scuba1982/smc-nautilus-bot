@@ -8,10 +8,15 @@ import xgboost as xgb
 from collections import deque
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.data import TradeTick as Trade
-from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import InstrumentId, Venue
 from nautilus_trader.model.enums import AggressorSide, OrderSide
 from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.currencies import Currency, USDT
+from nautilus_trader.model.instruments import CurrencyPair
+from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.core.datetime import nanos_to_secs
+from decimal import Decimal
 from live_packet_builder import VolumePacketBuilder, Packet, PartialPacket
 from features import calculate_er
 from smc_detector import detect_ote_signal
@@ -20,7 +25,7 @@ import datetime
 
 
 class MultiSMCStrategy(Strategy):
-    def __init__(self, strategy_config: dict, symbols_configs: dict, gui_queue=None, manual_order_queue=None):
+    def __init__(self, strategy_config: dict, symbols_configs: dict, gui_queue=None, manual_order_queue=None, sandbox_client_ref=None):
         """
         symbols_configs: { instrument_id: { 'bucket_usd': float, ... } }
         """
@@ -33,6 +38,7 @@ class MultiSMCStrategy(Strategy):
 
         self.gui_queue = gui_queue
         self.manual_order_queue = manual_order_queue
+        self._sandbox_client_ref = sandbox_client_ref  # [SandboxExecutionClient] for hot-insert
 
         # Реестр состояний для каждого инструмента
         self.instruments_data = {}
@@ -53,6 +59,7 @@ class MultiSMCStrategy(Strategy):
                 'packets': q_packets,
                 'close_prices': q_closes,
                 'pending_signal': None,
+                'dead_signals': set(), # Хранит swing_low отмененных зон, чтобы не воскрешать их
                 'in_position': False,
                 'entry_price_val': 0.0,
                 'pending_entries': {}, # client_order_id -> (signal, sl, tp) 
@@ -72,20 +79,32 @@ class MultiSMCStrategy(Strategy):
     def on_start(self):
         for inst_id, data in self.instruments_data.items():
             self.subscribe_trade_ticks(inst_id)
-            
+            # ... rest of on_start logic ...
+
             if len(data['packets']) >= data['warmup']:
                 df_history = self._to_df(inst_id)
                 history_window = 2000
                 eval_df = df_history[-history_window:] if len(df_history) > history_window else df_history
                 signal = detect_ote_signal(eval_df, swing_length=self.swing_length)
                 if signal:
+                    # ⚠️ ПРОВЕРКА: если свеча закрылась ниже swing_low — зона сломана, не входим
+                    # Прострел до 5% внутри свечи = норма (SMC liquidity grab)
+                    cur_price = float(data['packets'][-1].close)
+                    last_closed = cur_price # В истории последняя свеча закрыта
+                    invalid_reason = self._check_signal_invalid(signal, cur_price, last_closed)
+                    if invalid_reason:
+                        print(f"[SMC][{inst_id}] Сигнал из истории ИНВАЛИДЕН: {invalid_reason}. Пропускаем.")
+                        if self.gui_queue:
+                            sym_str = str(inst_id).split('.')[0]
+                            self.gui_queue.put(("log_msg", {"msg": f"[SMC] {sym_str} зона инвалидна: {invalid_reason}", "color": "c-r"}))
+                        continue
+
                     data['pending_signal'] = signal
                     print(f"[SMC][{inst_id}] Активный сигнал найден сразу после загрузки истории!")
-                    
-                    # Оцениваем модель по последнему историческому пакету, чтобы сразу показать процент в UI
+
                     proba = self._model_proba_partial(inst_id, signal, data['packets'][-1])
                     data['last_model_proba'] = proba
-                    
+
                     if proba >= self.model_threshold:
                         sl = signal['stop_loss']
                         tp = signal['tp_aggressive'] if proba >= 0.75 else signal['tp_standard']
@@ -106,6 +125,17 @@ class MultiSMCStrategy(Strategy):
             sig = data.get('pending_signal')
             # Если сигнал висит с момента on_start, ставим лимитку сейчас
             if sig and not data['in_position'] and len(data['pending_entries']) == 0:
+                # Повторная проверка валидности — между on_start и on_instrument цена могла измениться
+                cur_price = float(data['packets'][-1].close) if data['packets'] else 0
+                last_closed = cur_price
+                invalid_reason = self._check_signal_invalid(sig, cur_price, last_closed)
+                if invalid_reason:
+                    print(f"[SMC][{inst_id}] Отложенный сигнал ИНВАЛИДЕН: {invalid_reason}. Отменяем.")
+                    data['pending_signal'] = None
+                    if self.gui_queue:
+                        sym_str = str(inst_id).split('.')[0]
+                        self.gui_queue.put(("log_msg", {"msg": f"[SMC] {sym_str} зона инвалидна: {invalid_reason}", "color": "c-r"}))
+                    return
                 proba = data.get('last_model_proba')
                 if proba is None:
                     proba = self._model_proba_partial(inst_id, sig, data['packets'][-1])
@@ -118,50 +148,147 @@ class MultiSMCStrategy(Strategy):
                         data['pending_signal'] = None
 
     def on_update(self):
-        """Проверка очереди ручных команд из Flask."""
-        if self.manual_order_queue:
-            import queue
-            while not self.manual_order_queue.empty():
-                try:
-                    cmd = self.manual_order_queue.get_nowait()
-                    self._handle_manual_cmd(cmd)
-                except queue.Empty:
-                    break
-                except Exception as e:
-                    print(f"[SMC] Manual cmd error: {e}")
+        # BUG 8 FIX: Дублирование убрано. Очередь проверяется в on_trade_tick → _check_queue.
+        # on_update вызывается Nautilus периодически — используем только как fallback.
+        self._check_queue()
+
+    def _check_queue(self):
+        if not self.manual_order_queue:
+            return
+        import queue
+        while not self.manual_order_queue.empty():
+            try:
+                cmd = self.manual_order_queue.get_nowait()
+                print(f"[QUEUE] Got command: action={cmd.get('action')}, symbol={cmd.get('symbol','?')}")
+                self._handle_manual_cmd(cmd)
+            except queue.Empty:
+                break
+            except Exception as e:
+                print(f"[SMC] Ошибка обработки очереди: {e}")
+                import traceback
+                traceback.print_exc()
 
     def _handle_manual_cmd(self, cmd: dict):
         action = cmd.get("action")
+        
+        # Инструмент уже скачан во Flask, просто загружаем в оперативную память
+        if action == "add_instrument_ready":
+            sym = cmd.get("symbol")
+            inst_id = InstrumentId.from_str(f"{sym}.BINANCE")
+            hist_packets = cmd.get("hist_packets", [])
+            pb = cmd.get("packet_builder")
+            
+            from collections import deque
+            packet_window = getattr(self, "packet_window", 5000)
+            
+            q_packets = deque(maxlen=packet_window)
+            q_closes = deque(maxlen=self.lag)
+            
+            for p in hist_packets:
+                q_packets.append(p)
+                q_closes.append(p.close)
+            
+            self.instruments_data[inst_id] = {
+                'packet_builder': pb,
+                'packets': q_packets,
+                'close_prices': q_closes,
+                'pending_signal': None,
+                'pending_entries': {},
+                'pending_exits': {},       # BUG 6 FIX: было пропущено
+                'active_sl_id': None,
+                'active_tp_id': None,
+                'in_position': False,
+                'entry_price_val': 0.0,
+                'paper_pnl': 0.0,
+                'paper_wins': 0,
+                'paper_losses': 0,
+                'last_model_proba': None,
+                'dead_signals': set(),
+                'warmup': self.swing_length * 4
+            }
+            
+            # --- БЕЗОПАСНЫЙ HOT-INSERT АКТИВА ---
+            # С load_all=True Nautilus сам загрузил ~428 USDT пар с правильными параметрами.
+            # 13 монет (PEPE, SHIB и др.) не загрузились из-за maxQty > uint64 limit.
+            print(f"[HOT_INSERT] Checking cache for {inst_id}...")
+            cached_inst = self.cache.instrument(inst_id)
+            if not cached_inst:
+                exchange_info = cmd.get("exchange_info")
+                if exchange_info:
+                    cached_inst = self._register_instrument_from_exchange_info(inst_id, exchange_info)
+                if not cached_inst:
+                    print(f"[HOT_INSERT] WARN: {inst_id} не удалось создать. Пропускаем.")
+                    return
+            print(f"[HOT_INSERT] OK: {inst_id} в кэше (base={cached_inst.base_currency}, price_prec={cached_inst.price_precision})")
+
+            print(f"[MULTI-SMC] Подписка на {sym} (инструмент уже в кэше)")
+            self.subscribe_trade_ticks(inst_id)
+            print(f"[HOT_INSERT] subscribe_trade_ticks({inst_id}) OK")
+            
+            # Сразу обновляем интерфейс и проверяем зону SMC
+            if len(hist_packets) > 0:
+                if self.gui_queue:
+                    self._send_metrics(inst_id, hist_packets[-1], None)
+                
+                if len(hist_packets) >= self.instruments_data[inst_id]['warmup']:
+                    from smc_detector import detect_ote_signal
+                    df_history = self._to_df(inst_id)
+                    eval_df = df_history[-2000:] if len(df_history) > 2000 else df_history
+                    signal = detect_ote_signal(eval_df, swing_length=self.swing_length)
+                    
+                    if signal:
+                        cur_price = float(hist_packets[-1].close)
+                        invalid_reason = self._check_signal_invalid(signal, cur_price, cur_price)
+                        if not invalid_reason:
+                            self.instruments_data[inst_id]['pending_signal'] = signal
+                            proba = self._model_proba_partial(inst_id, signal, hist_packets[-1])
+                            self.instruments_data[inst_id]['last_model_proba'] = proba
+                            if proba >= self.model_threshold:
+                                sl = signal['stop_loss']
+                                tp = signal['tp_aggressive'] if proba >= 0.75 else signal['tp_standard']
+                                self._nautilus_enter_limit_advance(inst_id, signal['entry_price'], sl, tp, signal)
+                            else:
+                                if self.gui_queue:
+                                    m = f"[SMC] {sym} зона ({int(proba*100)}%) ниже порога {int(self.model_threshold*100)}%"
+                                    self.gui_queue.put(("log_msg", {"msg": m, "color": "c-w"}))
+                        else:
+                            if self.gui_queue:
+                                m = f"[SMC] {sym} зона сразу инвалидна: {invalid_reason}"
+                                self.gui_queue.put(("log_msg", {"msg": m, "color": "c-r"}))
+                                # Форсируем обновление UI, чтобы сбросить warmup
+                                self._send_metrics(inst_id, hist_packets[-1], None)
+                    else:
+                        # Если зон нет, просто обновляем еще раз для уверенности
+                        if self.gui_queue:
+                            self._send_metrics(inst_id, hist_packets[-1], None)
+            return
+
+        # ---- Остальные ручные команды из UI ----
         symbol = cmd.get("symbol")
         if not symbol: return
         
         inst_id = InstrumentId.from_str(f"{symbol}.BINANCE")
-        data = self.instruments_data.get(inst_id)
-        if not data: return
-
-        if action == "cancel_all":
+        if action == "cancel_all" and inst_id in self.instruments_data:
             self.cancel_all_orders(inst_id)
             print(f"[NAUTILUS][{inst_id}] CANCEL ALL")
-        elif action == "update_sltp":
-            print(f"[NAUTILUS][{inst_id}] SL/TP Update via UI not implemented in Multi-mode yet")
-        else:
-            # Обычный submit_order из UI
+        elif action not in ["update_sltp"]:
+            # Логика submit_order (ручной вход с UI)
+            data = self.instruments_data.get(inst_id)
+            if not data: return
+            
             side_str = cmd.get("side", "BUY")
             side = OrderSide.BUY if side_str == "BUY" else OrderSide.SELL
             price = float(cmd.get("price", 0))
             qty_val = float(cmd.get("qty", 0))
             
             instrument = self.cache.instrument(inst_id)
-            if not instrument: return
-            
-            order = self.order_factory.limit(
-                instrument_id=inst_id,
-                order_side=side,
-                price=instrument.make_price(price),
-                quantity=instrument.make_qty(qty_val)
-            )
-            self.submit_order(order)
-            print(f"[NAUTILUS][{inst_id}] SUBMIT MANUAL {side_str} @ {price}")
+            if instrument:
+                order = self.order_factory.limit(
+                    instrument_id=inst_id, order_side=side,
+                    price=instrument.make_price(price), quantity=instrument.make_qty(qty_val)
+                )
+                self.submit_order(order)
+                print(f"[NAUTILUS][{inst_id}] SUBMIT MANUAL {side_str} @ {price}")
             
         # Отправляем инфо о бакетах в GUI (можно расширить для списка)
         if self.gui_queue:
@@ -169,6 +296,8 @@ class MultiSMCStrategy(Strategy):
             self.gui_queue.put(("multi_bucket_info", buckets))
 
     def on_trade_tick(self, trade: Trade):
+        self._check_queue()
+        
         inst_id = trade.instrument_id
         if inst_id not in self.instruments_data:
             return
@@ -189,14 +318,44 @@ class MultiSMCStrategy(Strategy):
 
         # 2. Проверка сигналов и Динамическая Защита (Dynamic Cancel)
         
-        # А) Ищем новую OTE зону на закрытом пакете
+        # А) Проверка pending_signal на каждом живом тике
+        # BUG 14 FIX: защита от пустого массива пакетов (если история не загрузилась)
+        last_closed_price = float(data['packets'][-1].close) if data.get('packets') and len(data['packets']) > 0 else price
+        
         if data['pending_signal'] and partial:
             sig = data['pending_signal']
-            # Если цена ушла на перехай - инвалидируем сигнал до входа
-            if price > sig['swing_high']:
-                print(f"[SMC][{inst_id}] Перехай! {price:.4f} > {sig['swing_high']:.4f}. Сигнал будет обновлен.")
+            # Инвалидация 1: перехай или касание TP — движение ушло без нас
+            if price > sig['swing_high'] or price >= sig['tp_standard']:
+                print(f"[SMC][{inst_id}] Цель достигнута без нас! {price:.4f} >= TP/High. Сигнал инвалидирован.")
+                data['dead_signals'].add(round(sig['swing_low'], 8))
+                data['pending_signal'] = None
+            # Инвалидация 2: свеча ЗАКРЫЛАСЬ ниже swing_low (настоящий Слом Структуры)
+            elif last_closed_price < sig['swing_low']:
+                print(f"[SMC][{inst_id}] СЛОМ СТРУКТУРЫ (свеча закрылась ниже {sig['swing_low']:.4f}). Сигнал инвалидирован.")
+                if self.gui_queue:
+                    sym_str = str(inst_id).split('.')[0]
+                    self.gui_queue.put(("log_msg", {"msg": f"[SMC] {sym_str} слом структуры (закрытие ниже swing_low)", "color": "c-r"}))
+                data['dead_signals'].add(round(sig['swing_low'], 8))
+                data['pending_signal'] = None
+            # Инвалидация 3: слишком глубокий прострел внутри свечи (>5%)
+            elif price < sig['swing_low'] * 0.95:
+                pct = (sig['swing_low'] - price) / sig['swing_low'] * 100
+                print(f"[SMC][{inst_id}] СЛИШКОМ ГЛУБОКИЙ ПРОБОЙ! {price:.4f} < {sig['swing_low']*0.95:.4f} ({pct:.1f}%). Сигнал инвалидирован.")
+                if self.gui_queue:
+                    sym_str = str(inst_id).split('.')[0]
+                    self.gui_queue.put(("log_msg", {"msg": f"[SMC] {sym_str} пробой swing_low -{pct:.1f}% > 5%, зона сломана", "color": "c-r"}))
+                data['dead_signals'].add(round(sig['swing_low'], 8))
+                data['pending_signal'] = None
+            # Инвалидация 4: Цена ниже OTE зоны (pump-dump / полный разворот)
+            elif price < sig['ote_low']:
+                print(f"[SMC][{inst_id}] ЦЕНА НИЖЕ OTE ЗОНЫ! {price:.4f} < ote_low {sig['ote_low']:.4f}. Зона пройдена.")
+                if self.gui_queue:
+                    sym_str = str(inst_id).split('.')[0]
+                    self.gui_queue.put(("log_msg", {"msg": f"[SMC] {sym_str} цена ниже OTE зоны — полный разворот", "color": "c-r"}))
+                data['dead_signals'].add(round(sig['swing_low'], 8))
                 data['pending_signal'] = None
             elif not data['in_position'] and len(data['pending_entries']) == 0:
+                
                 # ВЫСТАВЛЕНИЕ УПРЕЖДАЮЩЕЙ ЛИМИТКИ (ADVANCE PLACEMENT)
                 # Вычисляем модель заранее и ставим LIMIT
                 proba = self._model_proba_partial(inst_id, sig, partial)
@@ -217,10 +376,39 @@ class MultiSMCStrategy(Strategy):
             to_cancel = []
             for client_id, (sig, sl, tp) in data['pending_entries'].items():
                 entry_price = sig['entry_price']
-                
-                # Если пока мы ждали наката лимитки цена ушла на перехай (отработала без нас) -> ОТМЕНА
-                if price > sig['swing_high']:
-                    print(f"[SMC][{inst_id}] ЛИМИТ ОТМЕНЕН: ЦЕНА УШЛА БЕЗ НАС (Перехай {price:.4f} > {sig['swing_high']:.4f})")
+
+                # Инвалидация 1: свеча закрылась ниже swing_low (слом структуры)
+                if last_closed_price < sig['swing_low']:
+                    data['dead_signals'].add(round(sig['swing_low'], 8))
+                    print(f"[SMC][{inst_id}] ЛИМИТ ОТМЕНЕН: СЛОМ СТРУКТУРЫ (закрытие < {sig['swing_low']:.4f})")
+                    to_cancel.append(client_id)
+                    if self.gui_queue:
+                        sym_str = str(inst_id).split(".")[0]
+                        self.gui_queue.put(("log_msg", {"msg": f"[SMC] {sym_str} Лимит отменен: слом структуры (закрытие ниже зоны).", "color": "c-r"}))
+                        self.gui_queue.put(("signal", {
+                            "symbol": sym_str, "action": "exit", "reason": "canc",
+                            "pnl": 0.0, "total_pnl": data.get('paper_pnl', 0.0)
+                        }))
+                    continue
+
+                # Инвалидация 2: экстремальный пробой внутри тика (>5%)
+                if price < sig['swing_low'] * 0.95:
+                    data['dead_signals'].add(round(sig['swing_low'], 8))
+                    print(f"[SMC][{inst_id}] ЛИМИТ ОТМЕНЕН: ГЛУБОКИЙ ПРОБОЙ (>5%)")
+                    to_cancel.append(client_id)
+                    if self.gui_queue:
+                        sym_str = str(inst_id).split(".")[0]
+                        self.gui_queue.put(("log_msg", {"msg": f"[SMC] {sym_str} Лимит отменен: глубокий пробой ниже зоны (>5%).", "color": "c-r"}))
+                        self.gui_queue.put(("signal", {
+                            "symbol": sym_str, "action": "exit", "reason": "canc",
+                            "pnl": 0.0, "total_pnl": data.get('paper_pnl', 0.0)
+                        }))
+                    continue
+
+                # Инвалидация 3: перехай или касание TP — движение ушло без нас (не отработали)
+                if price > sig['swing_high'] or price >= tp:
+                    data['dead_signals'].add(round(sig['swing_low'], 8))
+                    print(f"[SMC][{inst_id}] ЛИМИТ ОТМЕНЕН: ЦЕНА УШЛА БЕЗ НАС (TP/High достигнут {price:.4f})")
                     to_cancel.append(client_id)
                     
                     if self.gui_queue:
@@ -295,8 +483,14 @@ class MultiSMCStrategy(Strategy):
             eval_df = df_history[-history_window:] if len(df_history) > history_window else df_history
                 
             signal = detect_ote_signal(eval_df, swing_length=self.swing_length)
+            
+            # Если сигнал найден, но этот swing_low уже мертв (инвалидирован ранее) — игнорим его
             if signal:
-                data['pending_signal'] = signal
+                sl_round = round(signal['swing_low'], 8)
+                if sl_round in data['dead_signals']:
+                    signal = None
+                else:
+                    data['pending_signal'] = signal
 
         if self.gui_queue:
             sym_str = str(inst_id).split(".")[0]
@@ -311,7 +505,113 @@ class MultiSMCStrategy(Strategy):
                 "low":   packet.low,   "close": packet.close,
             }))
 
+    def _check_signal_invalid(self, signal: dict, current_price: float, last_closed_price: float) -> str | None:
+        """
+        Проверяет валидность сигнала.
+        
+        Правила SMC:
+        1. Свеча закрылась НА/НИЖЕ swing_low = СЛОМ СТРУКТУРЫ (BOS). ИНВАЛИДЕН.
+        2. Живая цена прострелила swing_low до 5% = liquidity grab. ВАЛИДЕН.
+        3. Живая цена прострелила swing_low > 5% = слишком глубокий пробой. ИНВАЛИДЕН.
+        4. Живая цена ушла ВЫШЕ swing_high = движение пропущено без нас. ИНВАЛИДЕН.
+        5. Цена ниже OTE зоны = полный разворот (pump-dump). ИНВАЛИДЕН.
+        """
+        swing_low  = signal.get('swing_low',  0)
+        swing_high = signal.get('swing_high', float('inf'))
+        ote_low    = signal.get('ote_low', 0)
+
+        if current_price <= 0 or swing_low <= 0:
+            return None
+
+        # Условие 1: Свеча закрылась на/ниже swing_low = BOS (слом структуры)
+        if last_closed_price > 0 and last_closed_price <= swing_low:
+             return f"свеча закрылась на/ниже swing_low {swing_low:.4f} (настоящий слом структуры)"
+
+        # Условие 2: Экстремальный прострел (больше 5%)
+        if current_price < swing_low * 0.95:
+            pct_below = (swing_low - current_price) / swing_low * 100
+            return f"цена {current_price:.4f} ниже swing_low {swing_low:.4f} на {pct_below:.1f}% (слишком глубокий пробой >5%)"
+
+        # Условие 3: Цена уже ушла ВЫШЕ swing_high = движение пропущено
+        if swing_high < float('inf') and current_price > swing_high:
+            pct_above = (current_price - swing_high) / swing_high * 100
+            return f"цена {current_price:.4f} выше swing_high {swing_high:.4f} на {pct_above:.1f}% — движение пропущено"
+
+        # Условие 4: Цена ниже OTE зоны = pump-dump / полный разворот
+        if ote_low > 0 and current_price < ote_low:
+            return f"цена {current_price:.4f} ниже OTE зоны {ote_low:.4f} — полный разворот (pump-dump)"
+
+        return None  # зона валидна
+
+    def _register_instrument_from_exchange_info(self, inst_id, exchange_info: dict):
+        """Create CurrencyPair from Binance exchangeInfo and register in cache + sandbox."""
+        try:
+            sym_name = exchange_info.get('symbol', str(inst_id).split('.')[0])
+            base_asset = exchange_info.get('baseAsset', '')
+            if not base_asset:
+                print(f"[HOT_INSERT] exchangeInfo missing baseAsset for {inst_id}")
+                return None
+
+            tick_s = "0.00000001"
+            step_s = "0.00000001"
+            for f in exchange_info.get('filters', []):
+                if f['filterType'] == 'PRICE_FILTER':
+                    tick_s = f['tickSize']
+                if f['filterType'] == 'LOT_SIZE':
+                    step_s = f['stepSize']
+
+            tick_s = tick_s.rstrip('0') or '0'
+            step_s = step_s.rstrip('0') or '0'
+            if tick_s.endswith('.'):
+                tick_s += '0'
+            if step_s.endswith('.'):
+                step_s += '0'
+
+            p_inc = Price.from_str(tick_s)
+            s_inc = Quantity.from_str(step_s)
+            base_cur = Currency.from_str(base_asset)
+
+            instrument = CurrencyPair(
+                instrument_id=inst_id,
+                raw_symbol=Symbol(sym_name),
+                base_currency=base_cur,
+                quote_currency=USDT,
+                price_precision=p_inc.precision,
+                size_precision=s_inc.precision,
+                price_increment=p_inc,
+                size_increment=s_inc,
+                lot_size=s_inc,
+                max_quantity=Quantity(18_000_000_000.0, precision=s_inc.precision),
+                min_quantity=Quantity.from_str(step_s),
+                max_notional=None,
+                min_notional=None,
+                max_price=Price(4_000_000_000.0, precision=p_inc.precision),
+                min_price=Price.from_str(tick_s),
+                margin_init=Decimal("0"),
+                margin_maint=Decimal("0"),
+                maker_fee=Decimal("0"),
+                taker_fee=Decimal("0"),
+                ts_event=self.clock.timestamp_ns(),
+                ts_init=self.clock.timestamp_ns(),
+            )
+
+            self.cache.add_instrument(instrument)
+            print(f"[HOT_INSERT] Registered {sym_name} in cache (base={base_asset}, price_prec={p_inc.precision}, size_prec={s_inc.precision})")
+
+            # НЕ вызываем sandbox.exchange.add_instrument() в рантайме!
+            # Это крашит Rust matching engine при параллельной обработке тиков.
+            # Все инструменты предрегистрируются ДО node.run_async() в flask_server.py.
+
+            return instrument
+
+        except Exception as e:
+            print(f"[HOT_INSERT] Failed to register {inst_id}: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     def _nautilus_enter_limit_advance(self, inst_id, entry_price_val: float, sl: float, tp: float, sig: dict):
+
         try:
             data = self.instruments_data[inst_id]
             instrument = self.cache.instrument(inst_id)
@@ -371,35 +671,45 @@ class MultiSMCStrategy(Strategy):
             data['in_position'] = True
             sig, sl_price, tp_price = data['pending_entries'].pop(client_id)
             
-            # Регистрируем выходы, чтобы знать, когда позиция закроется
-            # Так как мы выставим SL и TP новыми ордерами, нам нужно отслеживать их ID
-            qty = event.last_qty
-            data['entry_price_val'] = float(event.last_px)
+            # Регистрируем выходы
             qty = event.last_qty
             data['entry_price_val'] = float(event.last_px)
             instrument = self.cache.instrument(inst_id)
-            
+
             sl_price_obj = instrument.make_price(sl_price)
             tp_price_obj = instrument.make_price(tp_price)
-                
+
+            # Защита от отклонения SL: если bid уже ниже SL (gap-down), корректируем
+            try:
+                ob = self.cache.order_book(inst_id)
+                current_bid = ob.best_bid_price() if ob else None
+                if current_bid and float(current_bid) < sl_price:
+                    safe_sl = float(current_bid) * 0.999  # чуть ниже bid
+                    sl_price_obj = instrument.make_price(safe_sl)
+                    print(f"[NAUTILUS][{inst_id}] Аварийный SL: bid={float(current_bid):.4f} < SL={sl_price:.4f}, сдвигаем SL -> {safe_sl:.4f}")
+            except Exception:
+                pass
+
             sl_order = self.order_factory.stop_market(inst_id, OrderSide.SELL, qty, trigger_price=sl_price_obj)
             tp_order = self.order_factory.limit(inst_id, OrderSide.SELL, qty, price=tp_price_obj)
-            
+
             self.submit_order(sl_order)
             self.submit_order(tp_order)
             data['active_sl_id'] = sl_order.client_order_id
             data['active_tp_id'] = tp_order.client_order_id
-            
+
             print(f"[NAUTILUS][{inst_id}] ENTRY FILLED @ {data['entry_price_val']:.4f}. Placed SL={sl_price:.4f}, TP={tp_price:.4f}")
-            
-            # --- Логируем баланс после Входа ---
-            portfolio = self.portfolio
-            if portfolio:
-                acc = portfolio.account(self.portfolio.account_ids[0])
-                usdt_bal = acc.balance(Currency.from_str("USDT"))
-                btc_bal = acc.balance(Currency.from_str("BTC"))
-                print(f"[TEST] БАЛАНС ПОСЛЕ ВХОДА: {usdt_bal.free.as_double():.2f} USDT | {btc_bal.free.as_double():.5f} BTC")
+
+            # --- Логируем баланс после входа ---
+            try:
+                acc = self.cache.account_for_venue(Venue("BINANCE"))
+                if acc:
+                    usdt_bal = acc.balance(Currency.from_str("USDT"))
+                    print(f"[TEST] БАЛАНС ПОСЛЕ ВХОДА: {usdt_bal.free.as_double():.2f} USDT")
+            except Exception as _e:
+                print(f"[TEST] Баланс недоступен: {_e}")
             # ------------------------------------
+
             
             # Логируем вход в CSV
             try:
@@ -438,12 +748,14 @@ class MultiSMCStrategy(Strategy):
             print(f"[NAUTILUS][{inst_id}] POSITION CLOSED by {reason.upper()} @ {float(event.last_px):.4f}. PnL: {pnl_usd:.2f}%")
             
             # --- Логируем баланс после Выхода ---
-            portfolio = self.portfolio
-            if portfolio:
-                acc = portfolio.account(self.portfolio.account_ids[0])
-                usdt_bal = acc.balance(Currency.from_str("USDT"))
-                btc_bal = acc.balance(Currency.from_str("BTC"))
-                print(f"[TEST] БАЛАНС ПОСЛЕ ВЫХОДА: {usdt_bal.free.as_double():.2f} USDT | {btc_bal.free.as_double():.5f} BTC")
+            # BUG 13 FIX: не хардкодим BTC, используем USDT (общий для всех пар)
+            try:
+                acc = self.cache.account_for_venue(Venue("BINANCE"))
+                if acc:
+                    usdt_bal = acc.balance(Currency.from_str("USDT"))
+                    print(f"[TEST] БАЛАНС ПОСЛЕ ВЫХОДА: {usdt_bal.free.as_double():.2f} USDT")
+            except Exception as _e:
+                print(f"[TEST] Баланс недоступен: {_e}")
             # ------------------------------------
             
             # Логируем выход в CSV
@@ -467,7 +779,8 @@ class MultiSMCStrategy(Strategy):
             data = self.instruments_data[inst_id]
             r = signal['range_size']
             cur = partial.close
-            ote = (cur - signal['ote_low']) / r if r > 0 else 0.0
+            ote_width = signal['ote_high'] - signal['ote_low']
+            ote = (cur - signal['ote_low']) / ote_width if ote_width > 0 else 0.0
             
             prices = getattr(partial, 'prices', [])
             volatility = float(np.std(np.diff(np.log(prices)))) if len(prices) >= 2 else 0.0
@@ -508,73 +821,85 @@ class MultiSMCStrategy(Strategy):
         pass # Убираем спам в консоль
 
     def _send_metrics(self, inst_id, packet: Packet, signal: dict | None):
-        data = self.instruments_data[inst_id]
-        er = calculate_er(list(data['close_prices']), period=20)
+        try:
+            data = self.instruments_data[inst_id]
+            er = calculate_er(list(data['close_prices']), period=20)
 
-        current_signal = data['pending_signal'] or signal
-        if not current_signal and data['pending_entries']:
-            first_cid = next(iter(data['pending_entries']))
-            current_signal, _, _ = data['pending_entries'][first_cid]
-            
-        ote_dist, retr = None, None
-        price = packet.close
+            current_signal = data['pending_signal'] or signal
+            if not current_signal and data['pending_entries']:
+                first_cid = next(iter(data['pending_entries']))
+                current_signal, _, _ = data['pending_entries'][first_cid]
+                
+            ote_dist, retr = None, None
+            price = packet.close
 
-        if current_signal:
-            ote_high = current_signal['ote_high']
-            ote_low = current_signal['ote_low']
-            # Правильный расчёт расстояния до OTE зоны
-            if price > ote_high:
-                # Цена ВЫШЕ зоны — нужно упасть, расстояние положительное
-                ote_dist = (price - ote_high) / ote_high * 100
-            elif price < ote_low:
-                # Цена НИЖЕ зоны — ушла за invalidation
-                ote_dist = (ote_low - price) / ote_low * -100
+            if current_signal:
+                ote_high = current_signal['ote_high']
+                ote_low = current_signal['ote_low']
+                # Правильный расчёт расстояния до OTE зоны
+                if price > ote_high:
+                    ote_dist = (price - ote_high) / ote_high * 100
+                elif price < ote_low:
+                    ote_dist = (ote_low - price) / ote_low * -100
+                else:
+                    ote_dist = 0.0
+                retr = (current_signal['bos_high'] - price) / max(current_signal['bos_high'], 1e-9) * 100
+
+            # Если пакетов много (после загрузки истории), warmup_pct должен быть 100
+            total_pkts = len(data['packets'])
+            wp = round(total_pkts / data['warmup'] * 100, 1) if total_pkts < data['warmup'] else 100.0
+
+            res = {
+                "symbol": str(inst_id).split(".")[0],
+                "imbalance": round(packet.imbalance * 100, 2),
+                "vpin": round(packet.vpin * 100, 2),
+                "er": round(er * 100, 1),
+                "volatility": round(packet.candle_range * 100, 4),
+                "bucket": int(data['packet_builder'].bucket_usd) if data['packet_builder'] else 0,
+                "ote_distance": round(ote_dist, 2) if ote_dist is not None else None,
+                "retracement_pct": round(retr, 2) if retr is not None else None,
+                "warmup_pct": wp,
+                "packets_count": total_pkts,
+                "paper_pnl": round(data['paper_pnl'], 2),
+                "in_position": data['in_position'],
+                "has_signal": current_signal is not None,
+                "model_proba": data.get('last_model_proba')
+            }
+            if current_signal:
+                # ... (rest of signal fields)
+                res.update({
+                    "entry_705": round(current_signal['entry_price'], 6),
+                    "ote_high": round(current_signal['ote_high'], 6),
+                    "ote_low": round(current_signal['ote_low'], 6),
+                    "structural_sl": round(current_signal['stop_loss'], 6),
+                    "structural_tp": round(current_signal['tp_standard'], 6),
+                    "tp_conservative": round(current_signal['tp_conservative'], 6),
+                    "tp_aggressive": round(current_signal['tp_aggressive'], 6),
+                    "swing_high": round(current_signal['swing_high'], 6),
+                    "swing_low": round(current_signal['swing_low'], 6),
+                    "range_size": round(current_signal['range_size'], 6),
+                })
+                risk = abs(current_signal['entry_price'] - current_signal['stop_loss'])
+                reward = abs(current_signal['tp_standard'] - current_signal['entry_price'])
+                res["rr_ratio"] = round(reward / risk, 1) if risk > 0 else 0
             else:
-                # Цена В ЗОНЕ
-                ote_dist = 0.0
-            retr = (current_signal['bos_high'] - price) / max(current_signal['bos_high'], 1e-9) * 100
+                for k in ["entry_705","ote_high","ote_low","structural_sl","structural_tp","tp_conservative","tp_aggressive","swing_high","swing_low","range_size","rr_ratio"]:
+                    res[k] = None
 
-        wp = round(len(data['packets']) / data['warmup'] * 100, 1) if len(data['packets']) < data['warmup'] else 100.0
-
-        res = {
-            "symbol": str(inst_id).split(".")[0],
-            "imbalance": round(packet.imbalance * 100, 2),
-            "vpin": round(packet.vpin * 100, 2),
-            "er": round(er * 100, 1),
-            "volatility": round(packet.candle_range * 100, 4),
-            "bucket": int(data['packet_builder'].bucket_usd),
-            "ote_distance": round(ote_dist, 2) if ote_dist is not None else None,
-            "retracement_pct": round(retr, 2) if retr is not None else None,
-            "warmup_pct": wp,
-            "packets_count": len(data['packets']),
-            "paper_pnl": round(data['paper_pnl'], 2),
-            "in_position": data['in_position'],
-            "has_signal": current_signal is not None,
-            "model_proba": data.get('last_model_proba')
-        }
-        if current_signal:
-            # Entry 0.705 Sweet Spot (лимитка)
-            res["entry_705"] = round(current_signal['entry_price'], 6)
-            # Зона OTE (границы)
-            res["ote_high"] = round(current_signal['ote_high'], 6)
-            res["ote_low"] = round(current_signal['ote_low'], 6)
-            # Структурные уровни
-            res["structural_sl"] = round(current_signal['stop_loss'], 6)
-            res["structural_tp"] = round(current_signal['tp_standard'], 6)
-            res["tp_conservative"] = round(current_signal['tp_conservative'], 6)
-            res["tp_aggressive"] = round(current_signal['tp_aggressive'], 6)
-            res["swing_high"] = round(current_signal['swing_high'], 6)
-            res["swing_low"] = round(current_signal['swing_low'], 6)
-            res["range_size"] = round(current_signal['range_size'], 6)
-            # R:R
-            risk = abs(current_signal['entry_price'] - current_signal['stop_loss'])
-            reward = abs(current_signal['tp_standard'] - current_signal['entry_price'])
-            res["rr_ratio"] = round(reward / risk, 1) if risk > 0 else 0
-            
-        self.gui_queue.put(("metrics", res))
+            if self.gui_queue:
+                self.gui_queue.put(("metrics", res))
+        except Exception as e:
+            print(f"[SMC] Error in _send_metrics for {inst_id}: {e}")
 
     def _send_partial(self, inst_id, partial: PartialPacket):
+        # BUG 10 FIX: Throttle — макс 2 обновления/сек на символ (иначе Socket.IO захлебывается при 20+ монетах)
+        import time as _time
         data = self.instruments_data[inst_id]
+        now = _time.time()
+        if now - data.get('_last_partial_ts', 0) < 0.5:
+            return
+        data['_last_partial_ts'] = now
+        
         self.gui_queue.put(("partial", {
             "symbol": str(inst_id).split(".")[0],
             "time": nanos_to_secs(partial.timestamp),

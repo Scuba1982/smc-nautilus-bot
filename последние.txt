@@ -1,0 +1,51 @@
+личная мысль! Давай протестируем побольше монет — особенно те, которые были проблемными (мемкоины, мелкие):
+
+Testing Load IDs With Many Coins
+Tested 40 coins with load_ids. Results: 34/40 OK, 6 failed (PEPE, SHIB, FLOKI, BONK, BOME, 1000SATS) — all due to Nautilus maxQty out of range bug. All major coins work: BTC, ETH, SOL, DENT, MIRA, PUMP, UNI, WIF, etc. Sandbox exchange got all 34 instruments automatically.
+
+Files Edited
+Progress Updates
+1
+Running extended test with 30+ coins including memecoins and small-cap tokens
+
+2
+Sharing test results with user for approval to proceed
+
+Вот полные результаты теста 40 монет с load_ids:
+
+34/40 OK! 6 не загрузились:
+
+Статус	Монеты
+FAIL	PEPEUSDT, SHIBUSDT, FLOKIUSDT, BONKUSDT, BOMEUSDT, 1000SATSUSDT
+OK	Все остальные 34, включая DENT, MIRA, PUMP, WIF, HOT, UNI, SOL, BTC...
+Причина FAIL одна: Nautilus баг — maxQty out of range [0.0, 18_446_744_073.0]. Это монеты с огромным maxQty (целые числа > 18 млрд) — у них дробная часть цены настолько мелкая, что кол-во токенов огромное.
+
+Варианты:
+
+Применить load_ids для основных монет — 34 из 40 работают без ручной регистрации
+Для 6 проблемных монет — подставлять ручной CurrencyPair fallback (с maxQty в пределах лимита Nautilus)
+Применяю к flask_server.py?
+
+e_order_id=BINANCE-441-001, account_id=BINANCE-001, ts_event=1772163466910985300)
+2026-02-27T03:37:46.991250900Z [INFO] SEISMIC-SMC-MULTI.DataClient-BINANCE: Subscribed PEPEUSDT.BINANCE trades на пепе падает  тогда тебе вообще надовс е монеты сбинанс заркзить и првоерить ве те котрые падют отдельновс ена них пропсиать или поставить вбан
+
+
+Отличная идея! Загружу ВСЕ USDT пары с Binance и найду полный список проблемных:
+
+Testing All Binance Coins for Load IDs
+load_all=True loaded 3291 total / 428 USDT out of 441 correctly. Only 13 coins fail: 1000CHEEMSUSDT, 1000SATSUSDT, 1MBABYDOGEUSDT, BOMEUSDT, BONKUSDT, BTTCUSDT, DOGSUSDT, FLOKIUSDT, HMSTRUSDT, NEIROUSDT, PEPEUSDT, SHIBUSDT, XECUSDT. All due to maxQty out of range. Ban list saved to nautilus_banned.py.
+
+Files Edited
+Progress Updates
+1
+Creating test to load ALL USDT pairs from Binance and identify failures
+
+2
+Switching to load_all=True approach since load_ids crashes with 500+ symbols
+
+3
+Testing load_all=True to find all failing coins
+
+4
+Sharing comprehensive ban list with user
+
