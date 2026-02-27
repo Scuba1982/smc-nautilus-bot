@@ -36,8 +36,8 @@ smc_threshold: 0.5
 model_path: models/smc_model.json
 
 # --- Binance API ---
-api_key: "WhxJ36s27u5b2QtLgQq0S1zXsKt1nYz7ZvCdh54s3fcoakbuWQfj5BKMpdMRU5uR"
-api_secret: "j12MQjPSuHjHgi60NKSES12FmQyiNY8DWpj1eqpQBU29zZKhY0Bh34jvIz175EE7"
+api_key: ""
+api_secret: ""
 testnet: false
 
 # --- Connection (important with VPN) ---
