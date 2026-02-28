@@ -853,11 +853,22 @@
                 }
                 if (m.paper_pnl !== undefined) c.pnl = m.paper_pnl;
 
+                // BUG 15 FIX: Unrealized PnL через Nautilus Portfolio (нативный)
+                if (m.unrealized_pnl !== undefined && positions[sym] && !positions[sym].is_limit) {
+                    positions[sym].pnl = m.unrealized_pnl;
+                }
+
+                // Баланс sandbox аккаунта (от Nautilus Portfolio)
+                if (m.account_balance !== undefined && m.account_balance !== null) {
+                    window._nautilusBalance = m.account_balance;
+                }
+
                 c.status = computeStatus(c);
 
                 // Проверяем прогрев батча: если все прогрелись — чистим и берём следующий
                 checkBatchWarmup();
                 renderTable();
+                renderPositions();
                 updateCounters();
                 saveState();
             });
@@ -875,6 +886,13 @@
                 if (p.vpin !== undefined) coinData[sym].vpin = p.vpin;
                 if (p.ote_distance !== undefined) coinData[sym].oteDist = p.ote_distance;
                 if (p.retracement_pct !== undefined) coinData[sym].retrPct = p.retracement_pct;
+
+                // BUG 15 FIX: Live unrealized PnL для открытых позиций
+                if (p.unrealized_pnl !== undefined && positions[sym] && !positions[sym].is_limit) {
+                    positions[sym].pnl = p.unrealized_pnl;
+                    renderPositions();
+                }
+
                 renderTable();
             });
 
@@ -1045,7 +1063,11 @@
         // Вызывается когда батч прогрелся или истёк таймаут
         function onBatchDone() {
             if (activeBatch.length === 0) return;
-            // Убрано pruneNonZoneCoins(); по желанию пользователя - все монеты остаются в таблице
+
+            // BUG 16 FIX: Автоочистка монет без зон через 2 минуты
+            // (даём время на первоначальную SMC детекцию, потом убираем мусор)
+            schedulePruneNoZone();
+
             activeBatch = [];
             saveState();
             if (scanQueue.length > 0) {
@@ -1053,10 +1075,38 @@
                 setTimeout(launchNextBatch, 2000); // небольшая пауза между батчами
             } else {
                 log('[SCAN] Все батчи обработаны. Активных монет: ' + Object.keys(coinData).length, 'c-g');
+                // Финальная очистка через 2 минуты когда все батчи готовы
+                schedulePruneNoZone();
                 var st = document.getElementById('scannerStatus');
                 st.textContent = 'МОНИТОРИНГ ' + Object.keys(coinData).length + ' МОНЕТ';
                 st.className = 'status-text active';
             }
+        }
+
+        var _pruneNoZoneTimer = null;
+        function schedulePruneNoZone() {
+            // Чистим через 2 минуты — к этому моменту SMC детекция точно успела сработать
+            if (_pruneNoZoneTimer) clearTimeout(_pruneNoZoneTimer);
+            _pruneNoZoneTimer = setTimeout(function () {
+                var removed = [];
+                Object.keys(coinData).forEach(function (sym) {
+                    var c = coinData[sym];
+                    // Удаляем только если: warmup 100%, нет сигнала, нет позиции, нет лимитки
+                    if (c.warmupPct >= 100 && !c.hasSignal && !c.inPosition && !positions[sym]) {
+                        removed.push(sym);
+                        delete coinData[sym];
+                    }
+                });
+                if (removed.length > 0) {
+                    log('[CLEAN] Убрано ' + removed.length + ' монет без зон: ' + removed.slice(0, 5).join(', ') + (removed.length > 5 ? '...' : ''), 'c-y');
+                    renderTable();
+                    updateCounters();
+                    saveState();
+                    // Обновляем статус
+                    var st = document.getElementById('scannerStatus');
+                    st.textContent = 'МОНИТОРИНГ ' + Object.keys(coinData).length + ' МОНЕТ';
+                }
+            }, 120000); // 2 минуты
         }
 
         // Устанавливает таймаут на случай если warmup не завершится сам
@@ -1315,21 +1365,34 @@
             document.getElementById('vSetups').textContent = setups;
             document.getElementById('vCoins').textContent = Object.keys(coinData).length;
 
-            // PnL
-            var pnl = 0;
+            // PnL = realized (closed trades) + unrealized (open positions)
+            var realizedPnl = 0;
+            var unrealizedPnl = 0;
             Object.keys(coinData).forEach(function (sym) {
-                if (coinData[sym].pnl) pnl += coinData[sym].pnl;
+                if (coinData[sym].pnl) realizedPnl += coinData[sym].pnl;
             });
+            // BUG 15 FIX: добавляем unrealized PnL открытых позиций к суммарному
+            Object.keys(positions).forEach(function (sym) {
+                var p = positions[sym];
+                if (p && !p.is_limit && p.pnl) unrealizedPnl += p.pnl;
+            });
+            var pnl = realizedPnl + unrealizedPnl;
             var pnlEl = document.getElementById('vPnl');
             pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + '$';
             pnlEl.className = 'stat-value ' + (pnl >= 0 ? 'c-g' : 'c-r');
 
-            // Wallet Balance
-            var initialWallet = 10000.00;
-            var currentWallet = initialWallet + pnl;
+            // Wallet Balance — от Nautilus Sandbox Account (нативный, с комиссиями)
+            var SANDBOX_INITIAL = 1000000.0;
             var walletEl = document.getElementById('vWallet');
-            walletEl.textContent = currentWallet.toFixed(2) + ' $';
-            walletEl.className = 'stat-value ' + (currentWallet >= initialWallet ? 'c-g' : 'c-r');
+            if (window._nautilusBalance) {
+                var bal = window._nautilusBalance;
+                var walletPnl = bal - SANDBOX_INITIAL;
+                walletEl.textContent = (walletPnl >= 0 ? '+' : '') + walletPnl.toFixed(2) + ' $';
+                walletEl.className = 'stat-value ' + (walletPnl >= 0 ? 'c-g' : 'c-r');
+            } else {
+                walletEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + ' $';
+                walletEl.className = 'stat-value ' + (pnl >= 0 ? 'c-g' : 'c-r');
+            }
         }
 
         // ─── Helpers ─────────────────────────────────────────────────────

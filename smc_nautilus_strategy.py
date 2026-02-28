@@ -740,12 +740,15 @@ class MultiSMCStrategy(Strategy):
                     
             data['active_sl_id'] = data['active_tp_id'] = None
             data['in_position'] = False
-            
-            pnl_usd = (float(event.last_px) - data['entry_price_val']) / data['entry_price_val'] * 100.0
-            if not is_tp: pnl_usd = -abs(pnl_usd) # loss
+
+            # PnL в USD через qty из fill event (Nautilus даёт точный qty и цену)
+            exit_price = float(event.last_px)
+            entry_price = data['entry_price_val']
+            qty_coins = float(event.last_qty)
+            pnl_usd = qty_coins * (exit_price - entry_price)
 
             data['paper_pnl'] += pnl_usd
-            print(f"[NAUTILUS][{inst_id}] POSITION CLOSED by {reason.upper()} @ {float(event.last_px):.4f}. PnL: {pnl_usd:.2f}%")
+            print(f"[NAUTILUS][{inst_id}] POSITION CLOSED by {reason.upper()} @ {exit_price:.4f}. PnL: {pnl_usd:+.2f}$ (qty={qty_coins:.4f})")
             
             # --- Логируем баланс после Выхода ---
             # BUG 13 FIX: не хардкодим BTC, используем USDT (общий для всех пар)
@@ -863,7 +866,11 @@ class MultiSMCStrategy(Strategy):
                 "paper_pnl": round(data['paper_pnl'], 2),
                 "in_position": data['in_position'],
                 "has_signal": current_signal is not None,
-                "model_proba": data.get('last_model_proba')
+                "model_proba": data.get('last_model_proba'),
+                # BUG 15 FIX v2: unrealized PnL через Nautilus Portfolio (нативный, с комиссиями)
+                "unrealized_pnl": self._get_portfolio_unrealized_pnl(inst_id) if data['in_position'] else None,
+                # Баланс аккаунта sandbox (стартовый 1_000_000 USDT)
+                "account_balance": self._get_account_balance()
             }
             if current_signal:
                 # ... (rest of signal fields)
@@ -891,6 +898,29 @@ class MultiSMCStrategy(Strategy):
         except Exception as e:
             print(f"[SMC] Error in _send_metrics for {inst_id}: {e}")
 
+    # ── Nautilus Portfolio API helpers ──────────────────────────────────
+    def _get_portfolio_unrealized_pnl(self, inst_id) -> float | None:
+        """Unrealized PnL открытой позиции через Nautilus Portfolio (USD, с учётом комиссий)."""
+        try:
+            upnl = self.portfolio.unrealized_pnl(inst_id)
+            if upnl is not None:
+                return round(upnl.as_double(), 2)
+        except Exception:
+            pass
+        return None
+
+    def _get_account_balance(self) -> float | None:
+        """Текущий баланс USDT аккаунта sandbox (включает realized PnL + комиссии)."""
+        try:
+            acc = self.cache.account_for_venue(Venue("BINANCE"))
+            if acc:
+                usdt_bal = acc.balance(USDT)
+                if usdt_bal:
+                    return round(usdt_bal.total.as_double(), 2)
+        except Exception:
+            pass
+        return None
+
     def _send_partial(self, inst_id, partial: PartialPacket):
         # BUG 10 FIX: Throttle — макс 2 обновления/сек на символ (иначе Socket.IO захлебывается при 20+ монетах)
         import time as _time
@@ -899,14 +929,25 @@ class MultiSMCStrategy(Strategy):
         if now - data.get('_last_partial_ts', 0) < 0.5:
             return
         data['_last_partial_ts'] = now
-        
-        self.gui_queue.put(("partial", {
+
+        payload = {
             "symbol": str(inst_id).split(".")[0],
             "time": nanos_to_secs(partial.timestamp),
             "close": partial.close,
             "imbalance": round(partial.imbalance * 100, 2),
-            "fill_pct": round(partial.fill_pct * 100, 1)
-        }))
+            "fill_pct": round(partial.fill_pct * 100, 1),
+        }
+
+        # BUG 15 FIX: Unrealized PnL через Nautilus Portfolio (нативный, с комиссиями)
+        if data['in_position']:
+            try:
+                upnl = self.portfolio.unrealized_pnl(inst_id)
+                if upnl is not None:
+                    payload["unrealized_pnl"] = round(upnl.as_double(), 2)
+            except Exception:
+                pass
+
+        self.gui_queue.put(("partial", payload))
 
     def _to_df(self, inst_id) -> pd.DataFrame:
         data = self.instruments_data[inst_id]
